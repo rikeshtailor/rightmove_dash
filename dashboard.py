@@ -32,11 +32,28 @@ BASE_DIR = Path(__file__).resolve().parent
 RIGHTMOVE_PARQUET = BASE_DIR / "scraper" / "parquet"
 SPAREROOM_PARQUET = BASE_DIR / "spareroom" / "parquet"
 
+def parquet_cache_key(path: Path):
+    files = sorted(path.glob("*.parquet"))
+    if not files:
+        return 0, 0
+
+    latest_mtime = max(f.stat().st_mtime for f in files)
+    total_size = sum(f.stat().st_size for f in files)
+
+    return len(files), int(latest_mtime), total_size
+
 # ============================================================
 # PARQUET LOADER (PYARROW — GUARANTEED)
 # ============================================================
 
-def load_parquet_dir(path: Path) -> pd.DataFrame:
+@st.cache_data(show_spinner=True)
+def load_parquet_dir_cached(
+    path_str: str,
+    file_count: int,
+    latest_mtime: int,
+    total_size: int,
+) -> pd.DataFrame:
+    path = Path(path_str)
     files = sorted(path.glob("*.parquet"))
     if not files:
         return pd.DataFrame()
@@ -58,7 +75,11 @@ def load_parquet_dir(path: Path) -> pd.DataFrame:
 # ============================================================
 
 def load_rightmove() -> pd.DataFrame:
-    df = load_parquet_dir(RIGHTMOVE_PARQUET)
+    key = parquet_cache_key(RIGHTMOVE_PARQUET)
+    df = load_parquet_dir_cached(
+        str(RIGHTMOVE_PARQUET),
+        *key,
+    )
     if df.empty:
         return df
 
@@ -74,7 +95,11 @@ def load_rightmove() -> pd.DataFrame:
 
 
 def load_spareroom() -> pd.DataFrame:
-    df = load_parquet_dir(SPAREROOM_PARQUET)
+    key = parquet_cache_key(SPAREROOM_PARQUET)
+    df = load_parquet_dir_cached(
+        str(SPAREROOM_PARQUET),
+        *key,
+    )
     if df.empty:
         return df
 
