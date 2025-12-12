@@ -13,11 +13,21 @@ from pathlib import Path
 # PAGE CONFIG
 # ============================================================
 
+
+BASE_DIR = Path(__file__).resolve().parent
+
+RIGHTMOVE_PARQUET = BASE_DIR / "scraper" / "parquet"
+SPAREROOM_PARQUET = BASE_DIR / "spareroom" / "parquet"
+
+# --- TEMP DEBUG (can remove later) ---
 st.write("DEBUG — file:", __file__)
 st.write("DEBUG — base dir:", BASE_DIR)
 st.write("DEBUG — rightmove path:", RIGHTMOVE_PARQUET)
-st.write("DEBUG — exists:", RIGHTMOVE_PARQUET.exists())
-st.write("DEBUG — files:", list(RIGHTMOVE_PARQUET.glob("*.parquet")))
+st.write("DEBUG — rightmove exists:", RIGHTMOVE_PARQUET.exists())
+st.write("DEBUG — rightmove files:", list(RIGHTMOVE_PARQUET.glob("*.parquet")))
+st.write("DEBUG — spareroom path:", SPAREROOM_PARQUET)
+st.write("DEBUG — spareroom exists:", SPAREROOM_PARQUET.exists())
+st.write("DEBUG — spareroom files:", list(SPAREROOM_PARQUET.glob("*.parquet")))
 
 st.set_page_config(
     page_title="Property Listings Dashboard",
