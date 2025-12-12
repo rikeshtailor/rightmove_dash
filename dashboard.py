@@ -51,9 +51,27 @@ SPAREROOM_PARQUET = Path("../spareroom/parquet")
 
 def load_parquet_dir(path: Path) -> pd.DataFrame:
     files = sorted(path.glob("*.parquet"))
+
+    st.write(f"Loading parquet from: {path}")
+    st.write(f"Found {len(files)} files")
+
     if not files:
         return pd.DataFrame()
-    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+    dfs = []
+    for f in files:
+        try:
+            st.write(f"Reading {f.name}")
+            df = pd.read_parquet(f, engine="pyarrow")
+            st.write(f" → rows: {len(df):,}, cols: {list(df.columns)}")
+            dfs.append(df)
+        except Exception as e:
+            st.error(f"FAILED to read {f}: {e}")
+            raise
+
+    out = pd.concat(dfs, ignore_index=True)
+    st.write("Combined rows:", len(out))
+    return out
 
 
 def has_link_column():
