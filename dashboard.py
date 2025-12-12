@@ -13,6 +13,12 @@ from pathlib import Path
 # PAGE CONFIG
 # ============================================================
 
+st.write("DEBUG — file:", __file__)
+st.write("DEBUG — base dir:", BASE_DIR)
+st.write("DEBUG — rightmove path:", RIGHTMOVE_PARQUET)
+st.write("DEBUG — exists:", RIGHTMOVE_PARQUET.exists())
+st.write("DEBUG — files:", list(RIGHTMOVE_PARQUET.glob("*.parquet")))
+
 st.set_page_config(
     page_title="Property Listings Dashboard",
     layout="wide",
