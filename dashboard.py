@@ -31,6 +31,24 @@ st.write("DEBUG — spareroom path:", SPAREROOM_PARQUET)
 st.write("DEBUG — spareroom exists:", SPAREROOM_PARQUET.exists())
 st.write("DEBUG — spareroom files:", list(SPAREROOM_PARQUET.glob("*.parquet")))
 
+import pyarrow.parquet as pq
+
+test_rm = RIGHTMOVE_PARQUET.glob("*.parquet")
+test_rm = next(test_rm, None)
+
+if test_rm:
+    table = pq.read_table(test_rm)
+    st.write("TEST RM rows:", table.num_rows)
+    st.write("TEST RM cols:", table.schema.names)
+
+test_sr = SPAREROOM_PARQUET.glob("*.parquet")
+test_sr = next(test_sr, None)
+
+if test_sr:
+    table = pq.read_table(test_sr)
+    st.write("TEST SR rows:", table.num_rows)
+    st.write("TEST SR cols:", table.schema.names)
+
 st.set_page_config(
     page_title="Property Listings Dashboard",
     layout="wide",
