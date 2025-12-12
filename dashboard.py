@@ -12,7 +12,9 @@ from pathlib import Path
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-
+st.error("🔥 NEW CODE VERSION LOADED 🔥")
+st.write("Dashboard file:", __file__)
+st.write("Timestamp:", pd.Timestamp.utcnow())
 
 BASE_DIR = Path(__file__).resolve().parent
 
