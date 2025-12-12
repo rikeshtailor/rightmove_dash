@@ -146,8 +146,13 @@ def load_spareroom():
 rightmove_df = load_rightmove()
 spareroom_df = load_spareroom()
 
+if rightmove_df.empty:
+    st.warning("Rightmove data loaded but contains 0 rows.")
+
+if spareroom_df.empty:
+    st.warning("SpareRoom data loaded but contains 0 rows.")
+
 if rightmove_df.empty and spareroom_df.empty:
-    st.error("No data found. Check parquet paths.")
     st.stop()
 
 # ============================================================
