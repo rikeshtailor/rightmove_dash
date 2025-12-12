@@ -1,170 +1,221 @@
 # ============================================================
-# RIGHTMOVE DASHBOARD — TABLE + FILTERS + MAP VIEW
+# RIGHTMOVE DASHBOARD
+# Sidebar filters + Instant search + Saved presets + SQL
 # ============================================================
 
-import streamlit as st
-import pandas as pd
-import time
+import json
 from pathlib import Path
-from geopy.geocoders import Nominatim
+import pandas as pd
+import streamlit as st
+import duckdb
 
-# ------------------------------------------------------------
-# PAGE CONFIG
-# ------------------------------------------------------------
+# ============================================================
+# CONFIG
+# ============================================================
+
+PARQUET_DIR = Path("parquet")
+SAVED_FILTERS_FILE = Path("saved_filters.json")
 
 st.set_page_config(
     page_title="Rightmove Dashboard",
     layout="wide",
 )
 
-# ------------------------------------------------------------
-# LOAD DATA
-# ------------------------------------------------------------
+# ============================================================
+# DATA LOADING
+# ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-PARQUET_DIR = BASE_DIR / "parquet"
+@st.cache_data(show_spinner=True)
+def load_data():
+    files = sorted(PARQUET_DIR.glob("*.parquet"))
+    if not files:
+        return pd.DataFrame()
 
-parquet_files = sorted(PARQUET_DIR.glob("*.parquet"))
+    dfs = [pd.read_parquet(f) for f in files]
+    df = pd.concat(dfs, ignore_index=True)
 
-if not parquet_files:
-    st.error("No Parquet files found in /parquet")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["bedrooms"] = pd.to_numeric(df["bedrooms"], errors="coerce")
+    df["scraped_at"] = pd.to_datetime(df["scraped_at"], errors="coerce")
+
+    return df
+
+
+df = load_data()
+
+st.title("🏡 Rightmove Property Dashboard")
+
+if df.empty:
+    st.warning("No Parquet data found in ./parquet/")
     st.stop()
 
-df = pd.concat(
-    (pd.read_parquet(p) for p in parquet_files),
-    ignore_index=True
+# ============================================================
+# DUCKDB SETUP
+# ============================================================
+
+con = duckdb.connect(database=":memory:")
+con.register("properties", df)
+
+# ============================================================
+# SAVED FILTERS
+# ============================================================
+
+def load_saved_filters():
+    if SAVED_FILTERS_FILE.exists():
+        with open(SAVED_FILTERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_saved_filters(filters):
+    with open(SAVED_FILTERS_FILE, "w") as f:
+        json.dump(filters, f, indent=2)
+
+
+saved_filters = load_saved_filters()
+
+# ============================================================
+# SIDEBAR — FILTERS
+# ============================================================
+
+st.sidebar.header("🔎 Filters")
+
+search_text = st.sidebar.text_input(
+    "Instant search (address / postcode / URL)",
+    placeholder="e.g. SW1A, London, terrace"
 )
-
-# ------------------------------------------------------------
-# SIDEBAR (CLEAN + SIMPLE)
-# ------------------------------------------------------------
-
-st.sidebar.title("🔎 Filters")
 
 price_min, price_max = st.sidebar.slider(
     "Price (£)",
-    min_value=int(df["price"].min() or 0),
-    max_value=int(df["price"].max() or 1_000_000),
-    value=(
-        int(df["price"].min() or 0),
-        int(df["price"].max() or 1_000_000),
-    ),
-    step=5000,
+    int(df["price"].min(skipna=True)),
+    int(df["price"].max(skipna=True)),
+    (
+        int(df["price"].min(skipna=True)),
+        int(df["price"].max(skipna=True)),
+    )
 )
 
-bedrooms = st.sidebar.multiselect(
-    "Bedrooms",
-    sorted(df["bedrooms"].dropna().unique())
-)
+bedroom_options = sorted(df["bedrooms"].dropna().unique())
+bedrooms = st.sidebar.multiselect("Bedrooms", bedroom_options)
 
-ptype = st.sidebar.multiselect(
-    "Property Type",
-    sorted(df["property_type"].dropna().unique())
-)
+property_type_options = sorted(df["property_type"].dropna().unique())
+property_types = st.sidebar.multiselect("Property type", property_type_options)
 
-# ------------------------------------------------------------
-# APPLY FILTERS
-# ------------------------------------------------------------
+# ============================================================
+# SAVED PRESETS
+# ============================================================
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("💾 Saved filters")
+
+preset_names = ["—"] + list(saved_filters.keys())
+selected_preset = st.sidebar.selectbox("Load preset", preset_names)
+
+if selected_preset != "—":
+    preset = saved_filters[selected_preset]
+    search_text = preset["search_text"]
+    price_min, price_max = preset["price"]
+    bedrooms = preset["bedrooms"]
+    property_types = preset["property_types"]
+
+preset_name = st.sidebar.text_input("Save current filters as")
+
+if st.sidebar.button("💾 Save filters") and preset_name:
+    saved_filters[preset_name] = {
+        "search_text": search_text,
+        "price": [price_min, price_max],
+        "bedrooms": bedrooms,
+        "property_types": property_types,
+    }
+    save_saved_filters(saved_filters)
+    st.sidebar.success(f"Saved '{preset_name}'")
+
+# ============================================================
+# APPLY SIDEBAR FILTERS (BASE VIEW)
+# ============================================================
 
 filtered = df.copy()
 
 filtered = filtered[
-    (filtered["price"].fillna(0) >= price_min) &
-    (filtered["price"].fillna(0) <= price_max)
+    (filtered["price"] >= price_min) &
+    (filtered["price"] <= price_max)
 ]
 
 if bedrooms:
     filtered = filtered[filtered["bedrooms"].isin(bedrooms)]
 
-if ptype:
-    filtered = filtered[filtered["property_type"].isin(ptype)]
+if property_types:
+    filtered = filtered[filtered["property_type"].isin(property_types)]
 
-# ------------------------------------------------------------
-# MAIN TABLE
-# ------------------------------------------------------------
+if search_text:
+    q = search_text.lower()
+    filtered = filtered[
+        filtered["address"].str.lower().str.contains(q, na=False) |
+        filtered["postcode"].str.lower().str.contains(q, na=False) |
+        filtered["url"].str.lower().str.contains(q, na=False)
+    ]
 
-st.title("🏠 Rightmove Property Dashboard")
+# ============================================================
+# SQL QUERY PANEL
+# ============================================================
 
-st.caption(f"Showing {len(filtered):,} properties")
+st.markdown("---")
+st.subheader("🧾 SQL Query")
 
-st.dataframe(
-    filtered.sort_values("price", ascending=False),
-    use_container_width=True,
-    height=500
+sql_query = st.text_area(
+    "Query the data using SQL (table name: properties)",
+    height=160,
+    value="""SELECT
+    postcode,
+    COUNT(*) AS listings,
+    AVG(price) AS avg_price
+FROM properties
+WHERE price IS NOT NULL
+GROUP BY postcode
+ORDER BY avg_price DESC
+LIMIT 20;
+"""
 )
 
+run_sql = st.button("▶ Run SQL query")
+
+sql_result = None
+sql_error = None
+
+if run_sql:
+    try:
+        sql_result = con.execute(sql_query).df()
+    except Exception as e:
+        sql_error = str(e)
+
 # ============================================================
-# MAP VIEW (FIXED & WORKING)
+# DISPLAY RESULTS
 # ============================================================
 
-st.divider()
-st.header("🗺 Property Map")
+if sql_error:
+    st.error(sql_error)
 
-# ------------------------------------------------------------
-# Extract OUTCODE safely
-# ------------------------------------------------------------
+elif sql_result is not None:
+    st.subheader(f"📊 SQL Results ({len(sql_result):,} rows)")
+    st.dataframe(sql_result, use_container_width=True, height=700)
 
-def extract_outcode(pc):
-    if not isinstance(pc, str):
-        return None
-    pc = pc.strip().upper()
-    return pc.split(" ")[0] if pc else None
-
-filtered["outcode"] = filtered["postcode"].apply(extract_outcode)
-
-# ------------------------------------------------------------
-# Cached geocoding (OUTCODE → lat/lon)
-# ------------------------------------------------------------
-
-@st.cache_data(show_spinner=False)
-def geocode_outcodes(outcodes):
-    geolocator = Nominatim(user_agent="rightmove-dashboard")
-    latlon = {}
-
-    progress = st.progress(0)
-    total = len(outcodes)
-
-    for i, oc in enumerate(outcodes, 1):
-        try:
-            loc = geolocator.geocode(f"{oc}, UK", timeout=10)
-            if loc:
-                latlon[oc] = (loc.latitude, loc.longitude)
-        except:
-            pass
-
-        if i % 5 == 0:
-            progress.progress(i / total)
-
-        time.sleep(1)  # required to avoid being blocked
-
-    progress.empty()
-    return latlon
-
-# ------------------------------------------------------------
-# Apply lat/lon
-# ------------------------------------------------------------
-
-valid_outcodes = sorted(filtered["outcode"].dropna().unique())
-
-if not valid_outcodes:
-    st.error("No valid postcodes found for mapping.")
-    st.stop()
-
-st.caption("Geocoding postcodes (cached on first run)…")
-
-latlon_map = geocode_outcodes(valid_outcodes)
-
-filtered["lat"] = filtered["outcode"].map(lambda x: latlon_map.get(x, (None, None))[0])
-filtered["lon"] = filtered["outcode"].map(lambda x: latlon_map.get(x, (None, None))[1])
-
-map_df = filtered.dropna(subset=["lat", "lon"])
-
-# ------------------------------------------------------------
-# Render map
-# ------------------------------------------------------------
-
-if map_df.empty:
-    st.error("No properties could be mapped after geocoding.")
 else:
-    st.caption(f"Mapped properties: {len(map_df):,}")
-    st.map(map_df[["lat", "lon"]])
+    st.subheader(f"📊 Results ({len(filtered):,} properties)")
+    st.dataframe(
+        filtered.sort_values("price", ascending=True),
+        use_container_width=True,
+        height=700,
+    )
+
+# ============================================================
+# FOOTER METRICS
+# ============================================================
+
+st.markdown("---")
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("Total properties", f"{len(df):,}")
+col2.metric("Filtered", f"{len(filtered):,}")
+col3.metric("Min price", f"£{int(filtered['price'].min()):,}" if not filtered.empty else "—")
+col4.metric("Max price", f"£{int(filtered['price'].max()):,}" if not filtered.empty else "—")
