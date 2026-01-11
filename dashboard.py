@@ -556,7 +556,7 @@ if rm_df is not None:
                     .isin(selected_types)
                 ]
             else:
-                filtered_rm = filtered_rm.iloc[0:0]
+                pass
 
             # persist for views
             st.session_state["rm_property_types"] = selected_types
@@ -567,33 +567,39 @@ if rm_df is not None:
         pmin_data = float(rm_df["price_num"].min())
         pmax_data = float(rm_df["price_num"].max())
 
-        if st.session_state.get("rm_price_min") is None:
-            st.session_state["rm_price_min"] = pmin_data
-        if st.session_state.get("rm_price_max") is None:
-            st.session_state["rm_price_max"] = pmax_data
+        # Initialise / clamp BEFORE widget creation
+        cur_min = st.session_state.get("rm_price_min")
+        cur_max = st.session_state.get("rm_price_max")
+
+        if cur_min is None or cur_min <= 0 or cur_min < pmin_data or cur_min > pmax_data:
+            st.session_state["rm_price_min"] = int(pmin_data)
+        if cur_max is None or cur_max <= 0 or cur_max > pmax_data or cur_max < pmin_data:
+            st.session_state["rm_price_max"] = int(pmax_data)
 
         pcol1, pcol2 = st.sidebar.columns(2)
         with pcol1:
-            st.number_input("Min price (£)", min_value=0, value=int(st.session_state["rm_price_min"]), step=1000, key="rm_price_min")
+            st.number_input("Min price (£)", min_value=0, step=1000, key="rm_price_min")
         with pcol2:
-            st.number_input("Max price (£)", min_value=0, value=int(st.session_state["rm_price_max"]), step=1000, key="rm_price_max")
+            st.number_input("Max price (£)", min_value=0, step=1000, key="rm_price_max")
 
         lo = float(st.session_state["rm_price_min"])
         hi = float(st.session_state["rm_price_max"])
         if hi < lo:
             lo, hi = hi, lo
 
-        if "price_num" in filtered_rm.columns:
-            filtered_rm = filtered_rm[filtered_rm["price_num"].between(lo, hi)]
+        filtered_rm = filtered_rm[filtered_rm["price_num"].between(lo, hi)]
 
     # Bedrooms min/max — initialise from FULL rm_df
     if "bedrooms_num" in rm_df.columns and rm_df["bedrooms_num"].notna().any():
         bmin_data = float(rm_df["bedrooms_num"].min())
         bmax_data = float(rm_df["bedrooms_num"].max())
 
-        if st.session_state.get("rm_beds_min") is None:
+        cur_min = st.session_state.get("rm_beds_min")
+        cur_max = st.session_state.get("rm_beds_max")
+
+        if cur_min is None or cur_min < bmin_data or cur_min > bmax_data:
             st.session_state["rm_beds_min"] = bmin_data
-        if st.session_state.get("rm_beds_max") is None:
+        if cur_max is None or cur_max > bmax_data or cur_max < bmin_data:
             st.session_state["rm_beds_max"] = bmax_data
 
         bcol1, bcol2 = st.sidebar.columns(2)
@@ -607,8 +613,7 @@ if rm_df is not None:
         if hi < lo:
             lo, hi = hi, lo
 
-        if "bedrooms_num" in filtered_rm.columns:
-            filtered_rm = filtered_rm[filtered_rm["bedrooms_num"].between(lo, hi)]
+        filtered_rm = filtered_rm[filtered_rm["bedrooms_num"].between(lo, hi)]
             
     c1, c2 = st.sidebar.columns(2)
 
@@ -751,7 +756,6 @@ with col1:
         show_cols = [c for c in show_cols if c in filtered_rm.columns]
 
         table_df = filtered_rm.reset_index(drop=True)
-
         event = st.dataframe(
             table_df[show_cols] if show_cols else table_df,
             use_container_width=True,
@@ -759,6 +763,12 @@ with col1:
             selection_mode="single-row",
             on_select="rerun",
             key="rm_table",
+            column_config={
+                "url": st.column_config.LinkColumn(
+                    "URL",
+                    display_text="Open",
+                ),
+            },
         )
 
         selected_rows = []
