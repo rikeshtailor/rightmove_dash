@@ -651,28 +651,31 @@ if sr_offer_df is not None:
     filtered_sr_offer = sr_offer_df.copy()
 
     # Rent filter (uses price_num if present)
-    if "price_num" in sr_offer_df.columns and sr_offer_df["price_num"].notna().any():
-        smin_data = float(sr_offer_df["price_num"].min())
-        smax_data = float(sr_offer_df["price_num"].max())
+    if "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
+        pmin_data = float(rm_df["price_num"].min())
+        pmax_data = float(rm_df["price_num"].max())
 
-        if st.session_state.get("sr_price_min") is None:
-            st.session_state["sr_price_min"] = smin_data
-        if st.session_state.get("sr_price_max") is None:
-            st.session_state["sr_price_max"] = smax_data
+        # Initialise / clamp BEFORE widget creation
+        cur_min = st.session_state.get("rm_price_min")
+        cur_max = st.session_state.get("rm_price_max")
 
-        scol1, scol2 = st.sidebar.columns(2)
-        with scol1:
-            st.number_input("Min rent (£ pcm)", min_value=0, value=int(st.session_state["sr_price_min"]), step=50, key="sr_price_min")
-        with scol2:
-            st.number_input("Max rent (£ pcm)", min_value=0, value=int(st.session_state["sr_price_max"]), step=50, key="sr_price_max")
+        if cur_min is None or cur_min <= 0 or cur_min < pmin_data or cur_min > pmax_data:
+            st.session_state["rm_price_min"] = int(pmin_data)
+        if cur_max is None or cur_max <= 0 or cur_max > pmax_data or cur_max < pmin_data:
+            st.session_state["rm_price_max"] = int(pmax_data)
 
-        lo = float(st.session_state["sr_price_min"])
-        hi = float(st.session_state["sr_price_max"])
+        pcol1, pcol2 = st.sidebar.columns(2)
+        with pcol1:
+            st.number_input("Min price (£)", min_value=0, step=1000, key="rm_price_min")
+        with pcol2:
+            st.number_input("Max price (£)", min_value=0, step=1000, key="rm_price_max")
+
+        lo = float(st.session_state["rm_price_min"])
+        hi = float(st.session_state["rm_price_max"])
         if hi < lo:
             lo, hi = hi, lo
 
-        if "price_num" in filtered_sr_offer.columns:
-            filtered_sr_offer = filtered_sr_offer[filtered_sr_offer["price_num"].between(lo, hi)]
+        filtered_rm = filtered_rm[filtered_rm["price_num"].between(lo, hi)]
 
     # Outcodes with Select all / Clear all — FIXED
     if "outcode" in sr_offer_df.columns:
