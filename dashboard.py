@@ -49,10 +49,29 @@ def _safe_str(s: pd.Series) -> pd.Series:
 def _to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
+def _to_bool(series: pd.Series) -> pd.Series:
+    # handles real bool, 1/0, "true"/"false", "yes"/"no", etc.
+    if pd.api.types.is_bool_dtype(series):
+        return series
+    s = _safe_str(series).str.strip().str.lower()
+    return s.isin(["true", "t", "1", "yes", "y"])
 
 def _parse_price(series: pd.Series) -> pd.Series:
-    s = _safe_str(series).str.replace(r"[^\d]", "", regex=True)
-    return pd.to_numeric(s, errors="coerce")
+    # If it's already numeric, don't stringify & regex it (avoids the ".0" -> extra zero bug)
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    s = _safe_str(series).str.strip()
+
+    # Remove common currency/thousand separators but KEEP decimals
+    s = (
+        s.str.replace("£", "", regex=False)
+         .str.replace(",", "", regex=False)
+    )
+
+    # Extract the first number with optional decimals (handles "£1,200 pcm", "100000.0", etc.)
+    num = s.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
+    return pd.to_numeric(num, errors="coerce")
 
 
 def _ensure_latlon(
@@ -198,6 +217,8 @@ def _view_payload_from_state() -> dict:
             "sr_price_min": st.session_state.get("sr_price_min"),
             "sr_price_max": st.session_state.get("sr_price_max"),
             "sr_outcodes": st.session_state.get("sr_outcodes", []),
+            "rm_potential_auction": st.session_state.get("rm_potential_auction", False),
+            "rm_potential_hmo": st.session_state.get("rm_potential_hmo", False),
         },
         "map": {
             "center": st.session_state.get("map_center", UK_CENTER),
@@ -225,7 +246,8 @@ def _apply_view_payload(payload: dict) -> None:
     st.session_state["map_zoom"] = m.get("zoom", UK_ZOOM)
 
     st.session_state["selected_outcode"] = payload.get("selected_outcode")
-
+    st.session_state["rm_potential_auction"] = f.get("rm_potential_auction", False)
+    st.session_state["rm_potential_hmo"] = f.get("rm_potential_hmo", False)
 
 def _encode_payload(payload: dict) -> str:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -259,9 +281,13 @@ if "selected_outcode" not in st.session_state:
     st.session_state.selected_outcode = None
 
 # Rightmove filter state
-for k in ["rm_price_min", "rm_price_max", "rm_beds_min", "rm_beds_max", "rm_property_types"]:
+for k in ["rm_price_min", "rm_price_max", "rm_beds_min", "rm_beds_max", "rm_property_types",
+          "rm_potential_auction", "rm_potential_hmo"]:
     if k not in st.session_state:
-        st.session_state[k] = None if k != "rm_property_types" else []
+        if k == "rm_property_types":
+            st.session_state[k] = []
+        else:
+            st.session_state[k] = False
 
 # SpareRoom offered filter state
 for k in ["sr_price_min", "sr_price_max", "sr_outcodes"]:
@@ -583,6 +609,26 @@ if rm_df is not None:
 
         if "bedrooms_num" in filtered_rm.columns:
             filtered_rm = filtered_rm[filtered_rm["bedrooms_num"].between(lo, hi)]
+            
+    c1, c2 = st.sidebar.columns(2)
+
+    if "potential_auction" in rm_df.columns:
+        st.session_state["rm_potential_auction"] = c1.checkbox(
+            "Potential auction",
+            value=bool(st.session_state.get("rm_potential_auction", False)),
+            key="rm_potential_auction",
+        )
+        if st.session_state["rm_potential_auction"]:
+            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential auction"])]
+
+    if "potential_hmo" in rm_df.columns:
+        st.session_state["rm_potential_hmo"] = c2.checkbox(
+            "Potential HMO",
+            value=bool(st.session_state.get("rm_potential_hmo", False)),
+            key="rm_potential_hmo",
+        )
+        if st.session_state["rm_potential_hmo"]:
+            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential hmo"])]
 
     # keep only mappable rows for map layer
     if filtered_rm is not None and {"lat_num", "lon_num"}.issubset(filtered_rm.columns):
@@ -697,7 +743,11 @@ with col1:
     if rm_df is None:
         st.info("Load Rightmove to enable selection + postcode filtering.")
     else:
-        show_cols = ["address", "postcode", "price", "bedrooms", "property_type", "url"]
+        show_cols = [
+            "address", "postcode", "price", "bedrooms", "property_type",
+            "potential_auction", "potential_hmo",
+            "url",
+        ] 
         show_cols = [c for c in show_cols if c in filtered_rm.columns]
 
         table_df = filtered_rm.reset_index(drop=True)
