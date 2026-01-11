@@ -613,22 +613,22 @@ if rm_df is not None:
     c1, c2 = st.sidebar.columns(2)
 
     if "potential_auction" in rm_df.columns:
-        st.session_state["rm_potential_auction"] = c1.checkbox(
+        c1.checkbox(
             "Potential auction",
-            value=bool(st.session_state.get("rm_potential_auction", False)),
             key="rm_potential_auction",
+            value=bool(st.session_state.get("rm_potential_auction", False)),
         )
         if st.session_state["rm_potential_auction"]:
-            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential auction"])]
+            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_auction"])]
 
     if "potential_hmo" in rm_df.columns:
-        st.session_state["rm_potential_hmo"] = c2.checkbox(
+        c2.checkbox(
             "Potential HMO",
-            value=bool(st.session_state.get("rm_potential_hmo", False)),
             key="rm_potential_hmo",
+            value=bool(st.session_state.get("rm_potential_hmo", False)),
         )
         if st.session_state["rm_potential_hmo"]:
-            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential hmo"])]
+            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_hmo"])]
 
     # keep only mappable rows for map layer
     if filtered_rm is not None and {"lat_num", "lon_num"}.issubset(filtered_rm.columns):
