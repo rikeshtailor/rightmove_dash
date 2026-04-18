@@ -233,8 +233,10 @@ def _save_views(views: dict) -> None:
 def _view_payload_from_state() -> dict:
     return {
         "filters": {
-            "rm_price_range": st.session_state.get("rm_price_range"),
-            "rm_beds_range": st.session_state.get("rm_beds_range"),
+            "rm_price_min": st.session_state.get("rm_price_min"),
+            "rm_price_max": st.session_state.get("rm_price_max"),
+            "rm_beds_min": st.session_state.get("rm_beds_min"),
+            "rm_beds_max": st.session_state.get("rm_beds_max"),
             "rm_property_types": st.session_state.get("rm_property_types", []),
             "rm_potential_auction": st.session_state.get("rm_potential_auction", False),
             "rm_potential_hmo": st.session_state.get("rm_potential_hmo", False),
@@ -252,8 +254,10 @@ def _view_payload_from_state() -> dict:
 def _apply_view_payload(payload: dict) -> None:
     f = (payload or {}).get("filters", {})
     m = (payload or {}).get("map", {})
-    st.session_state["rm_price_range"] = f.get("rm_price_range")
-    st.session_state["rm_beds_range"] = f.get("rm_beds_range")
+    st.session_state["rm_price_min"] = f.get("rm_price_min")
+    st.session_state["rm_price_max"] = f.get("rm_price_max")
+    st.session_state["rm_beds_min"] = f.get("rm_beds_min")
+    st.session_state["rm_beds_max"] = f.get("rm_beds_max")
     st.session_state["rm_property_types"] = f.get("rm_property_types", [])
     st.session_state["rm_potential_auction"] = f.get("rm_potential_auction", False)
     st.session_state["rm_potential_hmo"] = f.get("rm_potential_hmo", False)
@@ -287,8 +291,10 @@ _DEFAULTS = {
     "map_center": UK_CENTER,
     "map_zoom": UK_ZOOM,
     "selected_outcode": None,
-    "rm_price_range": None,
-    "rm_beds_range": None,
+    "rm_price_min": None,
+    "rm_price_max": None,
+    "rm_beds_min": None,
+    "rm_beds_max": None,
     "rm_property_types": [],
     "rm_potential_auction": False,
     "rm_potential_hmo": False,
@@ -479,42 +485,40 @@ with st.expander("🔍 Filters", expanded=True):
 
         if rm_df is not None and "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
             _prices = rm_df["price_num"].dropna()
-            pmin = int(_prices.quantile(0.02))
-            pmax = int(_prices.quantile(0.98))
-            if pmin >= pmax:  # fallback if percentiles collapse (very small dataset)
-                pmin, pmax = int(_prices.min()), int(_prices.max())
-            if pmin < pmax:
-                _default = _slider_default(st.session_state.get("rm_price_range"), pmin, pmax)
-                filtered_rm = filtered_rm[
-                    filtered_rm["price_num"].between(
-                        *st.slider(
-                            "Price (£)", pmin, pmax, _default,
-                            step=max(1000, (pmax - pmin) // 200),
-                            format="£%d",
-                            key="rm_price_range",
-                        )
-                    )
-                ]
-                st.caption(f"Full range: £{int(_prices.min()):,} – £{int(_prices.max()):,}")
-            else:
-                st.caption(f"Price: £{pmin:,}")
+            # Initialise from percentiles on first load to avoid outlier-dominated defaults
+            if st.session_state["rm_price_min"] is None:
+                st.session_state["rm_price_min"] = int(_prices.quantile(0.02))
+            if st.session_state["rm_price_max"] is None:
+                st.session_state["rm_price_max"] = int(_prices.quantile(0.98))
+            _pc1, _pc2 = st.columns(2)
+            with _pc1:
+                st.number_input("Min price (£)", min_value=0, step=5000, key="rm_price_min")
+            with _pc2:
+                st.number_input("Max price (£)", min_value=0, step=5000, key="rm_price_max")
+            _lo = float(st.session_state["rm_price_min"])
+            _hi = float(st.session_state["rm_price_max"])
+            if _hi < _lo:
+                _lo, _hi = _hi, _lo
+            filtered_rm = filtered_rm[filtered_rm["price_num"].between(_lo, _hi)]
+            st.caption(f"Range: £{int(_prices.min()):,} – £{int(_prices.max()):,}")
 
         if rm_df is not None and "bedrooms_num" in rm_df.columns and rm_df["bedrooms_num"].notna().any():
             _beds = rm_df["bedrooms_num"].dropna()
-            bmin = int(_beds.quantile(0.02))
-            bmax = int(_beds.quantile(0.98))
-            if bmin >= bmax:
-                bmin, bmax = int(_beds.min()), int(_beds.max())
-            if bmin < bmax:
-                _default = _slider_default(st.session_state.get("rm_beds_range"), bmin, bmax)
-                filtered_rm = filtered_rm[
-                    filtered_rm["bedrooms_num"].between(
-                        *st.slider("Bedrooms", bmin, bmax, _default, key="rm_beds_range")
-                    )
-                ]
-                st.caption(f"Full range: {int(_beds.min())} – {int(_beds.max())}")
-            else:
-                st.caption(f"Bedrooms: {bmin}")
+            if st.session_state["rm_beds_min"] is None:
+                st.session_state["rm_beds_min"] = int(_beds.quantile(0.02))
+            if st.session_state["rm_beds_max"] is None:
+                st.session_state["rm_beds_max"] = int(_beds.quantile(0.98))
+            _bc1, _bc2 = st.columns(2)
+            with _bc1:
+                st.number_input("Min beds", min_value=0, step=1, key="rm_beds_min")
+            with _bc2:
+                st.number_input("Max beds", min_value=0, step=1, key="rm_beds_max")
+            _lo = float(st.session_state["rm_beds_min"])
+            _hi = float(st.session_state["rm_beds_max"])
+            if _hi < _lo:
+                _lo, _hi = _hi, _lo
+            filtered_rm = filtered_rm[filtered_rm["bedrooms_num"].between(_lo, _hi)]
+            st.caption(f"Range: {int(_beds.min())} – {int(_beds.max())}")
 
     # ── Column 1: Property type + auction/HMO flags ───────────────────────────
     with fc1:
