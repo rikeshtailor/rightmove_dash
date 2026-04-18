@@ -593,7 +593,9 @@ m = build_map(
     sr_offer_df=filtered_sr_offer,
     max_points_each=max_points_each,
 )
-st_folium(m, height=540, use_container_width=True, key="map_view", returned_objects=[])
+_lat, _lon = st.session_state.map_center
+_map_key = f"map_{_lat:.5f}_{_lon:.5f}_{st.session_state.map_zoom}"
+st_folium(m, height=540, use_container_width=True, key=_map_key, returned_objects=[])
 
 st.divider()
 
