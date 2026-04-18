@@ -86,17 +86,6 @@ def _postcode_outcode(series: pd.Series) -> pd.Series:
     return _safe_str(series).str.strip().str.upper().str.split().str[0]
 
 
-def _slider_default(saved, lo_bound: int, hi_bound: int) -> tuple:
-    """Return a valid (lo, hi) default for st.slider, safely clamped to [lo_bound, hi_bound]."""
-    if saved and len(saved) == 2:
-        try:
-            lo = max(lo_bound, min(hi_bound, int(saved[0])))
-            hi = min(hi_bound, max(lo_bound, int(saved[1])))
-            if lo <= hi:
-                return (lo, hi)
-        except (TypeError, ValueError):
-            pass
-    return (lo_bound, hi_bound)
 
 
 # ----------------------------
@@ -250,8 +239,6 @@ def _view_payload_from_state() -> dict:
             "rm_property_types": st.session_state.get("rm_property_types", []),
             "rm_potential_auction": st.session_state.get("rm_potential_auction", False),
             "rm_potential_hmo": st.session_state.get("rm_potential_hmo", False),
-            "sr_price_range": st.session_state.get("sr_price_range"),
-            "sr_outcodes": st.session_state.get("sr_outcodes", []),
         },
         "map": {
             "center": st.session_state.get("map_center", UK_CENTER),
@@ -271,8 +258,6 @@ def _apply_view_payload(payload: dict) -> None:
     st.session_state["rm_property_types"] = f.get("rm_property_types", [])
     st.session_state["rm_potential_auction"] = f.get("rm_potential_auction", False)
     st.session_state["rm_potential_hmo"] = f.get("rm_potential_hmo", False)
-    st.session_state["sr_price_range"] = f.get("sr_price_range")
-    st.session_state["sr_outcodes"] = f.get("sr_outcodes", [])
     st.session_state["map_center"] = m.get("center", UK_CENTER)
     st.session_state["map_zoom"] = m.get("zoom", UK_ZOOM)
     st.session_state["selected_outcode"] = payload.get("selected_outcode")
@@ -308,8 +293,6 @@ _DEFAULTS = {
     "rm_property_types": [],
     "rm_potential_auction": False,
     "rm_potential_hmo": False,
-    "sr_price_range": None,
-    "sr_outcodes": [],
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -487,7 +470,7 @@ filtered_rm = rm_df
 filtered_sr_offer = sr_offer_df
 
 with st.expander("🔍 Filters", expanded=True):
-    fc0, fc1, fc2 = st.columns(3)
+    fc0, fc1 = st.columns(2)
 
     # ── Column 0: Rightmove price + bedrooms ──────────────────────────────────
     with fc0:
@@ -571,57 +554,6 @@ with st.expander("🔍 Filters", expanded=True):
                 if _fb.checkbox("HMO only", key="rm_potential_hmo"):
                     filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_hmo"])]
 
-    # ── Column 2: SpareRoom offered ───────────────────────────────────────────
-    with fc2:
-        st.markdown("##### SpareRoom Offered")
-
-        if (
-            sr_offer_df is not None
-            and "price_num" in sr_offer_df.columns
-            and sr_offer_df["price_num"].notna().any()
-        ):
-            _rents = sr_offer_df["price_num"].dropna()
-            pmin = int(_rents.quantile(0.02))
-            pmax = int(_rents.quantile(0.98))
-            if pmin >= pmax:
-                pmin, pmax = int(_rents.min()), int(_rents.max())
-            if pmin < pmax:
-                _default = _slider_default(st.session_state.get("sr_price_range"), pmin, pmax)
-                filtered_sr_offer = filtered_sr_offer[
-                    filtered_sr_offer["price_num"].between(
-                        *st.slider(
-                            "Rent (£)", pmin, pmax, _default,
-                            step=max(50, (pmax - pmin) // 200),
-                            format="£%d",
-                            key="sr_price_range",
-                        )
-                    )
-                ]
-                st.caption(f"Full range: £{int(_rents.min()):,} – £{int(_rents.max()):,}")
-            else:
-                st.caption(f"Rent: £{pmin:,}")
-
-        if sr_offer_df is not None and "outcode" in sr_offer_df.columns:
-            _ocs = sorted(sr_offer_df["outcode"].dropna().unique().tolist())
-            if _ocs:
-                _oa, _ob = st.columns(2)
-                if _oa.button("All", use_container_width=True, key="sr_oc_all"):
-                    st.session_state["sr_outcodes"] = _ocs.copy()
-                    st.rerun()
-                if _ob.button("Clear", use_container_width=True, key="sr_oc_clear"):
-                    st.session_state["sr_outcodes"] = []
-                    st.rerun()
-
-                _sel_ocs = st.multiselect(
-                    "Outcodes", options=_ocs,
-                    default=st.session_state["sr_outcodes"],
-                    label_visibility="collapsed",
-                )
-                st.session_state["sr_outcodes"] = _sel_ocs
-                if _sel_ocs and filtered_sr_offer is not None:
-                    filtered_sr_offer = filtered_sr_offer[
-                        filtered_sr_offer["outcode"].isin(_sel_ocs)
-                    ]
 
 # Drop rows without coordinates before passing to map
 if filtered_rm is not None and {"lat_num", "lon_num"}.issubset(filtered_rm.columns):
