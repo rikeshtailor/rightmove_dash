@@ -129,6 +129,13 @@ def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
 
         # Build GeoJSON with a list comprehension — no iterrows
         records = pts[keep].fillna("").to_dict("records")
+
+        def _prop_value(k, v):
+            s = str(v)
+            if k == "url" and s.startswith("http"):
+                return f'<a href="{s}" target="_blank" rel="noopener noreferrer">View listing ↗</a>'
+            return s
+
         geojson = {
             "type": "FeatureCollection",
             "features": [
@@ -138,7 +145,7 @@ def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
                         "type": "Point",
                         "coordinates": [r["lon_num"], r["lat_num"]],
                     },
-                    "properties": {k: str(r[k]) for k in prop_cols},
+                    "properties": {k: _prop_value(k, r[k]) for k in prop_cols},
                 }
                 for r in records
             ],
@@ -158,7 +165,10 @@ def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
         if with_popup and prop_cols:
             folium.GeoJsonPopup(
                 fields=prop_cols,
-                aliases=[c.replace("_", " ").title() for c in prop_cols],
+                aliases=[
+                    "Link" if c == "url" else c.replace("_", " ").title()
+                    for c in prop_cols
+                ],
                 max_width=320,
             ).add_to(layer)
 
