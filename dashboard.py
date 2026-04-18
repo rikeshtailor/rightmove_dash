@@ -86,6 +86,19 @@ def _postcode_outcode(series: pd.Series) -> pd.Series:
     return _safe_str(series).str.strip().str.upper().str.split().str[0]
 
 
+def _slider_default(saved, lo_bound: int, hi_bound: int) -> tuple:
+    """Return a valid (lo, hi) default for st.slider, safely clamped to [lo_bound, hi_bound]."""
+    if saved and len(saved) == 2:
+        try:
+            lo = max(lo_bound, min(hi_bound, int(saved[0])))
+            hi = min(hi_bound, max(lo_bound, int(saved[1])))
+            if lo <= hi:
+                return (lo, hi)
+        except (TypeError, ValueError):
+            pass
+    return (lo_bound, hi_bound)
+
+
 # ----------------------------
 # MAP  (GeoJson path: one Python object per layer, Leaflet renders N markers)
 # ----------------------------
@@ -460,37 +473,33 @@ with st.expander("🔍 Filters", expanded=True):
         if rm_df is not None and "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
             pmin = int(rm_df["price_num"].min())
             pmax = int(rm_df["price_num"].max())
-            _saved = st.session_state.get("rm_price_range")
-            _default = (
-                (max(pmin, int(_saved[0])), min(pmax, int(_saved[1])))
-                if _saved and len(_saved) == 2
-                else (pmin, pmax)
-            )
-            filtered_rm = filtered_rm[
-                filtered_rm["price_num"].between(
-                    *st.slider(
-                        "Price (£)", pmin, pmax, _default,
-                        step=max(1000, (pmax - pmin) // 200),
-                        format="£%d",
-                        key="rm_price_range",
+            if pmin < pmax:
+                _default = _slider_default(st.session_state.get("rm_price_range"), pmin, pmax)
+                filtered_rm = filtered_rm[
+                    filtered_rm["price_num"].between(
+                        *st.slider(
+                            "Price (£)", pmin, pmax, _default,
+                            step=max(1000, (pmax - pmin) // 200),
+                            format="£%d",
+                            key="rm_price_range",
+                        )
                     )
-                )
-            ]
+                ]
+            else:
+                st.caption(f"Price: £{pmin:,}")
 
         if rm_df is not None and "bedrooms_num" in rm_df.columns and rm_df["bedrooms_num"].notna().any():
             bmin = int(rm_df["bedrooms_num"].min())
             bmax = int(rm_df["bedrooms_num"].max())
-            _saved = st.session_state.get("rm_beds_range")
-            _default = (
-                (max(bmin, int(_saved[0])), min(bmax, int(_saved[1])))
-                if _saved and len(_saved) == 2
-                else (bmin, bmax)
-            )
-            filtered_rm = filtered_rm[
-                filtered_rm["bedrooms_num"].between(
-                    *st.slider("Bedrooms", bmin, bmax, _default, key="rm_beds_range")
-                )
-            ]
+            if bmin < bmax:
+                _default = _slider_default(st.session_state.get("rm_beds_range"), bmin, bmax)
+                filtered_rm = filtered_rm[
+                    filtered_rm["bedrooms_num"].between(
+                        *st.slider("Bedrooms", bmin, bmax, _default, key="rm_beds_range")
+                    )
+                ]
+            else:
+                st.caption(f"Bedrooms: {bmin}")
 
     # ── Column 1: Property type + auction/HMO flags ───────────────────────────
     with fc1:
@@ -544,22 +553,20 @@ with st.expander("🔍 Filters", expanded=True):
         ):
             pmin = int(sr_offer_df["price_num"].min())
             pmax = int(sr_offer_df["price_num"].max())
-            _saved = st.session_state.get("sr_price_range")
-            _default = (
-                (max(pmin, int(_saved[0])), min(pmax, int(_saved[1])))
-                if _saved and len(_saved) == 2
-                else (pmin, pmax)
-            )
-            filtered_sr_offer = filtered_sr_offer[
-                filtered_sr_offer["price_num"].between(
-                    *st.slider(
-                        "Rent (£)", pmin, pmax, _default,
-                        step=max(50, (pmax - pmin) // 200),
-                        format="£%d",
-                        key="sr_price_range",
+            if pmin < pmax:
+                _default = _slider_default(st.session_state.get("sr_price_range"), pmin, pmax)
+                filtered_sr_offer = filtered_sr_offer[
+                    filtered_sr_offer["price_num"].between(
+                        *st.slider(
+                            "Rent (£)", pmin, pmax, _default,
+                            step=max(50, (pmax - pmin) // 200),
+                            format="£%d",
+                            key="sr_price_range",
+                        )
                     )
-                )
-            ]
+                ]
+            else:
+                st.caption(f"Rent: £{pmin:,}")
 
         if sr_offer_df is not None and "outcode" in sr_offer_df.columns:
             _ocs = sorted(sr_offer_df["outcode"].dropna().unique().tolist())
