@@ -648,6 +648,15 @@ with col1:
                 f"**{_row.get('address', '(no address)')}** &nbsp;|&nbsp; Outcode: {_outcode or 'n/a'}"
             )
 
+        _dl_df = _table[_show] if _show else _table
+        st.download_button(
+            label=f"⬇ Download ({len(_dl_df):,} rows)",
+            data=_dl_df.to_csv(index=False).encode("utf-8"),
+            file_name="rightmove_listings.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
 with col2:
     st.subheader("SpareRoom Wanted")
     if sr_wanted_df is None:
