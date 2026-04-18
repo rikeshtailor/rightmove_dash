@@ -49,113 +49,115 @@ def _safe_str(s: pd.Series) -> pd.Series:
 def _to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
+
 def _to_bool(series: pd.Series) -> pd.Series:
-    # handles real bool, 1/0, "true"/"false", "yes"/"no", etc.
     if pd.api.types.is_bool_dtype(series):
         return series
     s = _safe_str(series).str.strip().str.lower()
     return s.isin(["true", "t", "1", "yes", "y"])
 
+
 def _parse_price(series: pd.Series) -> pd.Series:
-    # If it's already numeric, don't stringify & regex it (avoids the ".0" -> extra zero bug)
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
-
     s = _safe_str(series).str.strip()
-
-    # Remove common currency/thousand separators but KEEP decimals
-    s = (
-        s.str.replace("£", "", regex=False)
-         .str.replace(",", "", regex=False)
-    )
-
-    # Extract the first number with optional decimals (handles "£1,200 pcm", "100000.0", etc.)
+    s = s.str.replace("£", "", regex=False).str.replace(",", "", regex=False)
     num = s.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
     return pd.to_numeric(num, errors="coerce")
 
 
-def _ensure_latlon(
-    df: pd.DataFrame,
-    lat_candidates=("lat", "latitude"),
-    lon_candidates=("lon", "lng", "longitude"),
-):
+def _ensure_latlon(df: pd.DataFrame) -> pd.DataFrame:
+    lat_candidates = ("lat", "latitude")
+    lon_candidates = ("lon", "lng", "longitude")
     lat_col = next((c for c in df.columns if c.lower() in lat_candidates), None)
     lon_col = next((c for c in df.columns if c.lower() in lon_candidates), None)
-
-    if lat_col is None or lon_col is None:
-        lat_col = lat_col or next((c for c in df.columns if "lat" in c.lower()), None)
-        lon_col = lon_col or next(
-            (c for c in df.columns if "lon" in c.lower() or "lng" in c.lower()), None
-        )
-
+    if lat_col is None:
+        lat_col = next((c for c in df.columns if "lat" in c.lower()), None)
+    if lon_col is None:
+        lon_col = next((c for c in df.columns if "lon" in c.lower() or "lng" in c.lower()), None)
     if lat_col is None or lon_col is None:
         return df
-
     df["lat_num"] = _to_num(df[lat_col])
     df["lon_num"] = _to_num(df[lon_col])
     return df
 
 
 def _postcode_outcode(series: pd.Series) -> pd.Series:
-    s = _safe_str(series).str.strip().str.upper()
-    return s.str.split().str[0]
+    return _safe_str(series).str.strip().str.upper().str.split().str[0]
 
 
+# ----------------------------
+# MAP  (GeoJson path: one Python object per layer, Leaflet renders N markers)
+# ----------------------------
 def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
-    m = folium.Map(location=center, zoom_start=zoom, tiles="OpenStreetMap", control_scale=True)
+    m = folium.Map(
+        location=center, zoom_start=zoom, tiles="CartoDB positron", control_scale=True
+    )
 
-    fg_rm = folium.FeatureGroup(name="Rightmove (for sale)", show=True)
-    fg_sr = folium.FeatureGroup(name="SpareRoom (offered)", show=True)
+    def _add_layer(df, name: str, color: str, with_popup: bool = True):
+        if df is None or df.empty:
+            return
+        pts = df.dropna(subset=["lat_num", "lon_num"]).head(max_points_each)
+        if pts.empty:
+            return
 
-    # Rightmove (red)
-    if rm_df is not None and {"lat_num", "lon_num"}.issubset(rm_df.columns):
-        pts = rm_df.dropna(subset=["lat_num", "lon_num"]).head(max_points_each)
-        for _, r in pts.iterrows():
-            popup = folium.Popup(
-                f"""
-                <b>{r.get('address','')}</b><br>
-                Postcode: {r.get('postcode','')}<br>
-                Price: {r.get('price','')}<br>
-                Beds: {r.get('bedrooms','')}<br>
-                Type: {r.get('property_type','')}<br>
-                <a href="{r.get('url','')}" target="_blank">Open listing</a>
-                """,
-                max_width=350,
-            )
-            folium.CircleMarker(
-                location=[float(r["lat_num"]), float(r["lon_num"])],
-                radius=3,
-                color="#e74c3c",
-                fill=True,
-                fill_color="#e74c3c",
+        prop_cols = [
+            c for c in ["address", "postcode", "price", "bedrooms", "property_type", "url"]
+            if c in pts.columns
+        ]
+        keep = prop_cols + ["lat_num", "lon_num"]
+
+        # Build GeoJSON with a list comprehension — no iterrows
+        records = pts[keep].fillna("").to_dict("records")
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [r["lon_num"], r["lat_num"]],
+                    },
+                    "properties": {k: str(r[k]) for k in prop_cols},
+                }
+                for r in records
+            ],
+        }
+
+        layer = folium.GeoJson(
+            geojson,
+            name=name,
+            marker=folium.CircleMarker(
+                radius=5,
+                fill_color=color,
+                color=color,
                 fill_opacity=0.7,
-                popup=popup,
-            ).add_to(fg_rm)
+                weight=1,
+            ),
+        )
+        if with_popup and prop_cols:
+            folium.GeoJsonPopup(
+                fields=prop_cols,
+                aliases=[c.replace("_", " ").title() for c in prop_cols],
+                max_width=320,
+            ).add_to(layer)
 
-    # SpareRoom offered (blue) — NO POPUPS if you prefer? (you said earlier you don't need them)
-    # We'll keep markers only (no popup) for performance/clarity.
-    if sr_offer_df is not None and {"lat_num", "lon_num"}.issubset(sr_offer_df.columns):
-        pts = sr_offer_df.dropna(subset=["lat_num", "lon_num"]).head(max_points_each)
-        for _, r in pts.iterrows():
-            folium.CircleMarker(
-                location=[float(r["lat_num"]), float(r["lon_num"])],
-                radius=3,
-                color="#2e86de",
-                fill=True,
-                fill_color="#2e86de",
-                fill_opacity=0.7,
-            ).add_to(fg_sr)
+        fg = folium.FeatureGroup(name=name, show=True)
+        layer.add_to(fg)
+        fg.add_to(m)
 
-    fg_rm.add_to(m)
-    fg_sr.add_to(m)
+    _add_layer(rm_df, "Rightmove (for sale)", "#e74c3c")
+    _add_layer(sr_offer_df, "SpareRoom (offered)", "#2e86de", with_popup=False)
     folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
+# ----------------------------
+# DATA LOADING (cached)
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def load_rightmove_from_path(path_str: str) -> pd.DataFrame:
-    path = Path(path_str)
-    df = _read_any_path(path)
+    df = _read_any_path(Path(path_str))
     df["price_num"] = _parse_price(df["price"]) if "price" in df.columns else pd.Series(dtype="float")
     df["bedrooms_num"] = _to_num(df["bedrooms"]) if "bedrooms" in df.columns else pd.Series(dtype="float")
     df = _ensure_latlon(df)
@@ -166,8 +168,7 @@ def load_rightmove_from_path(path_str: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_generic_from_path(path_str: str) -> pd.DataFrame:
-    path = Path(path_str)
-    df = _read_any_path(path)
+    df = _read_any_path(Path(path_str))
     df = _ensure_latlon(df)
     if "postcode" in df.columns:
         df["outcode"] = _postcode_outcode(df["postcode"])
@@ -191,6 +192,9 @@ def _ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ----------------------------
+# VIEWS
+# ----------------------------
 def _load_views() -> dict:
     _ensure_data_dir()
     if not VIEWS_PATH.exists():
@@ -209,16 +213,13 @@ def _save_views(views: dict) -> None:
 def _view_payload_from_state() -> dict:
     return {
         "filters": {
-            "rm_price_min": st.session_state.get("rm_price_min"),
-            "rm_price_max": st.session_state.get("rm_price_max"),
-            "rm_beds_min": st.session_state.get("rm_beds_min"),
-            "rm_beds_max": st.session_state.get("rm_beds_max"),
+            "rm_price_range": st.session_state.get("rm_price_range"),
+            "rm_beds_range": st.session_state.get("rm_beds_range"),
             "rm_property_types": st.session_state.get("rm_property_types", []),
-            "sr_price_min": st.session_state.get("sr_price_min"),
-            "sr_price_max": st.session_state.get("sr_price_max"),
-            "sr_outcodes": st.session_state.get("sr_outcodes", []),
             "rm_potential_auction": st.session_state.get("rm_potential_auction", False),
             "rm_potential_hmo": st.session_state.get("rm_potential_hmo", False),
+            "sr_price_range": st.session_state.get("sr_price_range"),
+            "sr_outcodes": st.session_state.get("sr_outcodes", []),
         },
         "map": {
             "center": st.session_state.get("map_center", UK_CENTER),
@@ -231,23 +232,17 @@ def _view_payload_from_state() -> dict:
 def _apply_view_payload(payload: dict) -> None:
     f = (payload or {}).get("filters", {})
     m = (payload or {}).get("map", {})
-
-    st.session_state["rm_price_min"] = f.get("rm_price_min")
-    st.session_state["rm_price_max"] = f.get("rm_price_max")
-    st.session_state["rm_beds_min"] = f.get("rm_beds_min")
-    st.session_state["rm_beds_max"] = f.get("rm_beds_max")
+    st.session_state["rm_price_range"] = f.get("rm_price_range")
+    st.session_state["rm_beds_range"] = f.get("rm_beds_range")
     st.session_state["rm_property_types"] = f.get("rm_property_types", [])
-
-    st.session_state["sr_price_min"] = f.get("sr_price_min")
-    st.session_state["sr_price_max"] = f.get("sr_price_max")
-    st.session_state["sr_outcodes"] = f.get("sr_outcodes", [])
-
-    st.session_state["map_center"] = m.get("center", UK_CENTER)
-    st.session_state["map_zoom"] = m.get("zoom", UK_ZOOM)
-
-    st.session_state["selected_outcode"] = payload.get("selected_outcode")
     st.session_state["rm_potential_auction"] = f.get("rm_potential_auction", False)
     st.session_state["rm_potential_hmo"] = f.get("rm_potential_hmo", False)
+    st.session_state["sr_price_range"] = f.get("sr_price_range")
+    st.session_state["sr_outcodes"] = f.get("sr_outcodes", [])
+    st.session_state["map_center"] = m.get("center", UK_CENTER)
+    st.session_state["map_zoom"] = m.get("zoom", UK_ZOOM)
+    st.session_state["selected_outcode"] = payload.get("selected_outcode")
+
 
 def _encode_payload(payload: dict) -> str:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -263,233 +258,180 @@ def _decode_payload(s: str) -> dict | None:
 
 
 # ----------------------------
-# STATE
+# SESSION STATE INIT
 # ----------------------------
-if "rm_df" not in st.session_state:
-    st.session_state.rm_df = None
-if "sr_offer_df" not in st.session_state:
-    st.session_state.sr_offer_df = None
-if "sr_wanted_df" not in st.session_state:
-    st.session_state.sr_wanted_df = None
-
-if "map_center" not in st.session_state:
-    st.session_state.map_center = UK_CENTER
-if "map_zoom" not in st.session_state:
-    st.session_state.map_zoom = UK_ZOOM
-
-if "selected_outcode" not in st.session_state:
-    st.session_state.selected_outcode = None
-
-# Rightmove filter state
-for k in ["rm_price_min", "rm_price_max", "rm_beds_min", "rm_beds_max", "rm_property_types",
-          "rm_potential_auction", "rm_potential_hmo"]:
-    if k not in st.session_state:
-        if k == "rm_property_types":
-            st.session_state[k] = []
-        else:
-            st.session_state[k] = False
-
-# SpareRoom offered filter state
-for k in ["sr_price_min", "sr_price_max", "sr_outcodes"]:
-    if k not in st.session_state:
-        st.session_state[k] = None if k != "sr_outcodes" else []
+_DEFAULTS = {
+    "rm_df": None,
+    "sr_offer_df": None,
+    "sr_wanted_df": None,
+    "map_center": UK_CENTER,
+    "map_zoom": UK_ZOOM,
+    "selected_outcode": None,
+    "rm_price_range": None,
+    "rm_beds_range": None,
+    "rm_property_types": [],
+    "rm_potential_auction": False,
+    "rm_potential_hmo": False,
+    "sr_price_range": None,
+    "sr_outcodes": [],
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 
 # ----------------------------
-# URL view restore (shareable)
+# URL view restore
 # ----------------------------
-q = st.query_params
-if "view_b64" in q and q["view_b64"]:
-    payload = _decode_payload(q["view_b64"])
-    if payload:
-        _apply_view_payload(payload)
+_q = st.query_params
+if "view_b64" in _q and _q["view_b64"]:
+    _payload = _decode_payload(_q["view_b64"])
+    if _payload:
+        _apply_view_payload(_payload)
         st.query_params.clear()
 
 
 # ----------------------------
-# SIDEBAR: DATA SOURCE
+# SIDEBAR: DATA LOADING
 # ----------------------------
-st.sidebar.title("Data")
-
-data_source = st.sidebar.radio(
-    "Load data from…",
-    ["Repo files (recommended for deployment)", "Upload files (local)"],
-    index=0,
-)
-
-st.sidebar.caption(f"Data directory: `{DATA_DIR.as_posix()}`")
-max_points_each = st.sidebar.slider("Max points per layer (performance)", 500, 8000, 3000, step=500)
+st.sidebar.title("Property Dashboard")
+st.sidebar.caption(f"`{DATA_DIR.as_posix()}`")
 st.sidebar.divider()
 
+_source = st.sidebar.radio("Load from", ["Repo files", "Upload"], horizontal=True)
 
-def _load_from_repo_ui():
-    files = _list_data_files(extensions=(".parquet", ".csv"))
+
+def _repo_loader():
+    files = _list_data_files()
     if not files:
-        st.sidebar.warning("No data files found in ./data. Add your parquet/csv files to the repo under `data/`.")
+        st.sidebar.warning("No .parquet/.csv files found in ./data")
         return
-
-    file_names = [f.name for f in files]
+    names = [f.name for f in files]
     name_to_path = {f.name: str(f) for f in files}
 
     st.sidebar.subheader("Rightmove")
-    rm_choice = st.sidebar.selectbox("Rightmove file", ["(none)"] + file_names, index=0, key="rm_repo_choice")
-    rm_load = st.sidebar.button("Load Rightmove", key="rm_repo_load")
+    rm_choice = st.sidebar.selectbox(
+        "RM file", ["(none)"] + names, key="rm_repo_choice", label_visibility="collapsed"
+    )
+    if st.sidebar.button("Load", key="rm_repo_load", use_container_width=True) and rm_choice != "(none)":
+        try:
+            st.session_state.rm_df = load_rightmove_from_path(name_to_path[rm_choice])
+            st.sidebar.success(f"{len(st.session_state.rm_df):,} rows")
+        except Exception as e:
+            st.sidebar.error(str(e))
 
     st.sidebar.subheader("SpareRoom Offered")
-    sr_offer_choice = st.sidebar.selectbox(
-        "SpareRoom Offered file", ["(none)"] + file_names, index=0, key="sr_offer_repo_choice"
+    sro_choice = st.sidebar.selectbox(
+        "SRO file", ["(none)"] + names, key="sro_repo_choice", label_visibility="collapsed"
     )
-    sr_offer_load = st.sidebar.button("Load SpareRoom Offered", key="sr_offer_repo_load")
+    if st.sidebar.button("Load", key="sro_repo_load", use_container_width=True) and sro_choice != "(none)":
+        try:
+            st.session_state.sr_offer_df = load_generic_from_path(name_to_path[sro_choice])
+            st.sidebar.success(f"{len(st.session_state.sr_offer_df):,} rows")
+        except Exception as e:
+            st.sidebar.error(str(e))
 
     st.sidebar.subheader("SpareRoom Wanted")
-    sr_wanted_choice = st.sidebar.selectbox(
-        "SpareRoom Wanted file", ["(none)"] + file_names, index=0, key="sr_wanted_repo_choice"
+    srw_choice = st.sidebar.selectbox(
+        "SRW file", ["(none)"] + names, key="srw_repo_choice", label_visibility="collapsed"
     )
-    sr_wanted_load = st.sidebar.button("Load SpareRoom Wanted", key="sr_wanted_repo_load")
-
-    if rm_load and rm_choice != "(none)":
+    if st.sidebar.button("Load", key="srw_repo_load", use_container_width=True) and srw_choice != "(none)":
         try:
-            df = load_rightmove_from_path(name_to_path[rm_choice])
+            df = load_generic_from_path(name_to_path[srw_choice])
+            if "location" in df.columns and "outcode" not in df.columns:
+                df["outcode"] = _postcode_outcode(df["location"])
+            st.session_state.sr_wanted_df = df
+            st.sidebar.success(f"{len(df):,} rows")
+        except Exception as e:
+            st.sidebar.error(str(e))
+
+
+def _upload_loader():
+    rm_file = st.sidebar.file_uploader("Rightmove (.parquet)", type=["parquet"])
+    if st.sidebar.button("Load Rightmove", use_container_width=True) and rm_file:
+        try:
+            df = pd.read_parquet(rm_file)
+            df["price_num"] = _parse_price(df["price"]) if "price" in df.columns else pd.Series(dtype="float")
+            df["bedrooms_num"] = _to_num(df["bedrooms"]) if "bedrooms" in df.columns else pd.Series(dtype="float")
+            df = _ensure_latlon(df)
+            if "postcode" in df.columns:
+                df["outcode"] = _postcode_outcode(df["postcode"])
             st.session_state.rm_df = df
-            st.sidebar.success(f"Loaded Rightmove: {len(df):,} rows")
+            st.sidebar.success(f"{len(df):,} rows")
         except Exception as e:
-            st.sidebar.error(f"Rightmove load failed: {e}")
+            st.sidebar.error(str(e))
 
-    if sr_offer_load and sr_offer_choice != "(none)":
+    sro_file = st.sidebar.file_uploader("SpareRoom Offered (.parquet/.csv)", type=["parquet", "csv"])
+    if st.sidebar.button("Load SR Offered", use_container_width=True) and sro_file:
         try:
-            df = load_generic_from_path(name_to_path[sr_offer_choice])
+            df = _read_any_upload(sro_file)
+            df = _ensure_latlon(df)
+            if "postcode" in df.columns:
+                df["outcode"] = _postcode_outcode(df["postcode"])
+            if "price" in df.columns:
+                df["price_num"] = _parse_price(df["price"])
+            elif "rent" in df.columns:
+                df["price_num"] = _parse_price(df["rent"])
             st.session_state.sr_offer_df = df
-            st.sidebar.success(f"Loaded SpareRoom Offered: {len(df):,} rows")
+            st.sidebar.success(f"{len(df):,} rows")
         except Exception as e:
-            st.sidebar.error(f"SpareRoom Offered load failed: {e}")
+            st.sidebar.error(str(e))
 
-    if sr_wanted_load and sr_wanted_choice != "(none)":
+    srw_file = st.sidebar.file_uploader("SpareRoom Wanted (.parquet/.csv)", type=["parquet", "csv"])
+    if st.sidebar.button("Load SR Wanted", use_container_width=True) and srw_file:
         try:
-            df = load_generic_from_path(name_to_path[sr_wanted_choice])
+            df = _read_any_upload(srw_file)
             if "postcode" in df.columns:
                 df["outcode"] = _postcode_outcode(df["postcode"])
             elif "location" in df.columns:
                 df["outcode"] = _postcode_outcode(df["location"])
             st.session_state.sr_wanted_df = df
-            st.sidebar.success(f"Loaded SpareRoom Wanted: {len(df):,} rows")
+            st.sidebar.success(f"{len(df):,} rows")
         except Exception as e:
-            st.sidebar.error(f"SpareRoom Wanted load failed: {e}")
+            st.sidebar.error(str(e))
 
 
-def _load_from_upload_ui():
-    rm_file = st.sidebar.file_uploader("Rightmove (parquet)", type=["parquet"], key="rm_uploader")
-    rm_load = st.sidebar.button("Load Rightmove", key="rm_load")
-
-    sr_offer_file = st.sidebar.file_uploader(
-        "SpareRoom Offered (parquet/csv)", type=["parquet", "csv"], key="sr_offer_uploader"
-    )
-    sr_offer_load = st.sidebar.button("Load SpareRoom Offered", key="sr_offer_load")
-
-    sr_wanted_file = st.sidebar.file_uploader(
-        "SpareRoom Wanted (parquet/csv)", type=["parquet", "csv"], key="sr_wanted_uploader"
-    )
-    sr_wanted_load = st.sidebar.button("Load SpareRoom Wanted", key="sr_wanted_load")
-
-    if rm_load:
-        if rm_file is None:
-            st.sidebar.warning("Select a Rightmove parquet first.")
-        else:
-            try:
-                df = pd.read_parquet(rm_file)
-                df["price_num"] = _parse_price(df["price"]) if "price" in df.columns else pd.Series(dtype="float")
-                df["bedrooms_num"] = _to_num(df["bedrooms"]) if "bedrooms" in df.columns else pd.Series(dtype="float")
-                df = _ensure_latlon(df)
-                if "postcode" in df.columns:
-                    df["outcode"] = _postcode_outcode(df["postcode"])
-                st.session_state.rm_df = df
-                st.sidebar.success(f"Loaded Rightmove: {len(df):,} rows")
-            except Exception as e:
-                st.sidebar.error(f"Rightmove load failed: {e}")
-
-    if sr_offer_load:
-        if sr_offer_file is None:
-            st.sidebar.warning("Select a SpareRoom Offered file first.")
-        else:
-            try:
-                df = _read_any_upload(sr_offer_file)
-                df = _ensure_latlon(df)
-                if "postcode" in df.columns:
-                    df["outcode"] = _postcode_outcode(df["postcode"])
-                if "price" in df.columns:
-                    df["price_num"] = _parse_price(df["price"])
-                elif "rent" in df.columns:
-                    df["price_num"] = _parse_price(df["rent"])
-                st.session_state.sr_offer_df = df
-                st.sidebar.success(f"Loaded SpareRoom Offered: {len(df):,} rows")
-            except Exception as e:
-                st.sidebar.error(f"SpareRoom Offered load failed: {e}")
-
-    if sr_wanted_load:
-        if sr_wanted_file is None:
-            st.sidebar.warning("Select a SpareRoom Wanted file first.")
-        else:
-            try:
-                df = _read_any_upload(sr_wanted_file)
-                if "postcode" in df.columns:
-                    df["outcode"] = _postcode_outcode(df["postcode"])
-                elif "location" in df.columns:
-                    df["outcode"] = _postcode_outcode(df["location"])
-                st.session_state.sr_wanted_df = df
-                st.sidebar.success(f"Loaded SpareRoom Wanted: {len(df):,} rows")
-            except Exception as e:
-                st.sidebar.error(f"SpareRoom Wanted load failed: {e}")
-
-
-if data_source == "Repo files (recommended for deployment)":
-    _load_from_repo_ui()
+if _source == "Repo files":
+    _repo_loader()
 else:
-    _load_from_upload_ui()
+    _upload_loader()
 
-
-# ----------------------------
-# SIDEBAR: VIEWS (PERSIST + SHARE)
-# ----------------------------
 st.sidebar.divider()
-st.sidebar.subheader("Views")
 
-views = _load_views()
-view_names = ["(none)"] + sorted(views.keys())
-selected_view = st.sidebar.selectbox("Saved views", view_names, index=0, key="views_select")
-colv1, colv2, colv3 = st.sidebar.columns(3)
+# ----------------------------
+# SIDEBAR: VIEWS
+# ----------------------------
+st.sidebar.subheader("Saved views")
+_views = _load_views()
+_view_names = ["(none)"] + sorted(_views.keys())
+_sel_view = st.sidebar.selectbox("View", _view_names, key="views_select", label_visibility="collapsed")
 
-with colv1:
-    if st.button("Load", use_container_width=True, disabled=(selected_view == "(none)")):
-        payload = views.get(selected_view)
-        if payload:
-            _apply_view_payload(payload)
-            st.rerun()
+_vc1, _vc2, _vc3 = st.sidebar.columns(3)
+if _vc1.button("Load", use_container_width=True, disabled=(_sel_view == "(none)")):
+    _p = _views.get(_sel_view)
+    if _p:
+        _apply_view_payload(_p)
+        st.rerun()
+if _vc2.button("Delete", use_container_width=True, disabled=(_sel_view == "(none)")):
+    _views.pop(_sel_view, None)
+    _save_views(_views)
+    st.rerun()
+if _vc3.button("Share", use_container_width=True, disabled=(_sel_view == "(none)")):
+    _p = _views.get(_sel_view)
+    if _p:
+        st.query_params["view_b64"] = _encode_payload(_p)
+        st.sidebar.info("Copy the URL from the address bar.")
 
-with colv2:
-    if st.button("Delete", use_container_width=True, disabled=(selected_view == "(none)")):
-        if selected_view in views:
-            views.pop(selected_view, None)
-            _save_views(views)
-            st.rerun()
-
-with colv3:
-    if st.button("Share", use_container_width=True, disabled=(selected_view == "(none)")):
-        payload = views.get(selected_view)
-        if payload:
-            st.query_params.clear()
-            st.query_params["view_b64"] = _encode_payload(payload)
-            st.sidebar.success("Shareable URL set (copy browser address bar).")
-
-new_view_name = st.sidebar.text_input("New view name", value="", key="new_view_name").strip()
-if st.sidebar.button("Save current as view", use_container_width=True, disabled=(new_view_name == "")):
-    payload = _view_payload_from_state()
-    views[new_view_name] = payload
-    _save_views(views)
-    st.sidebar.success(f"Saved view: {new_view_name}")
+_new_name = st.sidebar.text_input("Save current as…", key="new_view_name").strip()
+if st.sidebar.button("💾 Save view", use_container_width=True, disabled=(not _new_name)):
+    _views[_new_name] = _view_payload_from_state()
+    _save_views(_views)
+    st.sidebar.success(f'Saved "{_new_name}"')
     st.rerun()
 
 
 # ----------------------------
-# MAIN UI
+# MAIN — guard
 # ----------------------------
 st.title("🏠 Property Dashboard")
 
@@ -498,229 +440,180 @@ sr_offer_df = st.session_state.sr_offer_df
 sr_wanted_df = st.session_state.sr_wanted_df
 
 if rm_df is None and sr_offer_df is None and sr_wanted_df is None:
-    st.info("Load at least one dataset from the sidebar.")
+    st.info("👈 Load at least one dataset from the sidebar to get started.")
     st.stop()
 
 
 # ----------------------------
-# RIGHTMOVE FILTERS (STATE-DRIVEN, ONE PASS)
+# FILTERS  (3-column expander in main area)
 # ----------------------------
 filtered_rm = rm_df
-if rm_df is not None:
-    st.sidebar.divider()
-    st.sidebar.subheader("Rightmove filters")
-
-    filtered_rm = rm_df.copy()
-
-    # Property type filter (Select all / Clear all) — FIXED
-    if "property_type" in rm_df.columns:
-        options = sorted(
-            rm_df["property_type"]
-            .astype("string")
-            .fillna("")
-            .replace("nan", "")
-            .loc[lambda s: s.str.strip() != ""]
-            .unique()
-            .tolist()
-        )
-
-        if options:
-            # initialise once
-            if not st.session_state["rm_property_types"]:
-                st.session_state["rm_property_types"] = options.copy()
-
-            st.sidebar.markdown("**Property type**")
-            c1, c2 = st.sidebar.columns(2)
-
-            if c1.button("Select all", key="rm_pt_select_all"):
-                st.session_state["rm_property_types"] = options.copy()
-                st.rerun()
-
-            if c2.button("Clear all", key="rm_pt_clear_all"):
-                st.session_state["rm_property_types"] = []
-                st.rerun()
-
-            # widget READS state, does NOT write it
-            selected_types = st.sidebar.multiselect(
-                " ",
-                options=options,
-                default=st.session_state["rm_property_types"],
-                label_visibility="collapsed",
-            )
-
-            # apply filter using local value
-            if selected_types:
-                filtered_rm = filtered_rm[
-                    filtered_rm["property_type"]
-                    .astype("string")
-                    .isin(selected_types)
-                ]
-            else:
-                pass
-
-            # persist for views
-            st.session_state["rm_property_types"] = selected_types
-
-
-    # Price min/max — initialise from FULL rm_df (not already-filtered)
-    if "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
-        pmin_data = float(rm_df["price_num"].min())
-        pmax_data = float(rm_df["price_num"].max())
-
-        # Initialise / clamp BEFORE widget creation
-        cur_min = st.session_state.get("rm_price_min")
-        cur_max = st.session_state.get("rm_price_max")
-
-        if cur_min is None or cur_min <= 0 or cur_min < pmin_data or cur_min > pmax_data:
-            st.session_state["rm_price_min"] = int(pmin_data)
-        if cur_max is None or cur_max <= 0 or cur_max > pmax_data or cur_max < pmin_data:
-            st.session_state["rm_price_max"] = int(pmax_data)
-
-        pcol1, pcol2 = st.sidebar.columns(2)
-        with pcol1:
-            st.number_input("Min price (£)", min_value=0, step=1000, key="rm_price_min")
-        with pcol2:
-            st.number_input("Max price (£)", min_value=0, step=1000, key="rm_price_max")
-
-        lo = float(st.session_state["rm_price_min"])
-        hi = float(st.session_state["rm_price_max"])
-        if hi < lo:
-            lo, hi = hi, lo
-
-        filtered_rm = filtered_rm[filtered_rm["price_num"].between(lo, hi)]
-
-    # Bedrooms min/max — initialise from FULL rm_df
-    if "bedrooms_num" in rm_df.columns and rm_df["bedrooms_num"].notna().any():
-        bmin_data = float(rm_df["bedrooms_num"].min())
-        bmax_data = float(rm_df["bedrooms_num"].max())
-
-        cur_min = st.session_state.get("rm_beds_min")
-        cur_max = st.session_state.get("rm_beds_max")
-
-        if cur_min is None or cur_min < bmin_data or cur_min > bmax_data:
-            st.session_state["rm_beds_min"] = bmin_data
-        if cur_max is None or cur_max > bmax_data or cur_max < bmin_data:
-            st.session_state["rm_beds_max"] = bmax_data
-
-        bcol1, bcol2 = st.sidebar.columns(2)
-        with bcol1:
-            st.number_input("Min bedrooms", min_value=0, value=int(st.session_state["rm_beds_min"]), step=1, key="rm_beds_min")
-        with bcol2:
-            st.number_input("Max bedrooms", min_value=0, value=int(st.session_state["rm_beds_max"]), step=1, key="rm_beds_max")
-
-        lo = float(st.session_state["rm_beds_min"])
-        hi = float(st.session_state["rm_beds_max"])
-        if hi < lo:
-            lo, hi = hi, lo
-
-        filtered_rm = filtered_rm[filtered_rm["bedrooms_num"].between(lo, hi)]
-            
-    c1, c2 = st.sidebar.columns(2)
-
-    if "potential_auction" in rm_df.columns:
-        c1.checkbox(
-            "Potential auction",
-            key="rm_potential_auction",
-            value=bool(st.session_state.get("rm_potential_auction", False)),
-        )
-        if st.session_state["rm_potential_auction"]:
-            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_auction"])]
-
-    if "potential_hmo" in rm_df.columns:
-        c2.checkbox(
-            "Potential HMO",
-            key="rm_potential_hmo",
-            value=bool(st.session_state.get("rm_potential_hmo", False)),
-        )
-        if st.session_state["rm_potential_hmo"]:
-            filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_hmo"])]
-
-    # keep only mappable rows for map layer
-    if filtered_rm is not None and {"lat_num", "lon_num"}.issubset(filtered_rm.columns):
-        filtered_rm = filtered_rm.dropna(subset=["lat_num", "lon_num"])
-
-
-# ----------------------------
-# SPAREROOM OFFERED FILTERS (STATE-DRIVEN)
-# ----------------------------
 filtered_sr_offer = sr_offer_df
-if sr_offer_df is not None:
-    st.sidebar.divider()
-    st.sidebar.subheader("SpareRoom Offered filters")
 
-    filtered_sr_offer = sr_offer_df.copy()
+with st.expander("🔍 Filters", expanded=True):
+    fc0, fc1, fc2 = st.columns(3)
 
-    # Rent filter (uses price_num if present)
-    if "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
-        pmin_data = float(rm_df["price_num"].min())
-        pmax_data = float(rm_df["price_num"].max())
+    # ── Column 0: Rightmove price + bedrooms ──────────────────────────────────
+    with fc0:
+        st.markdown("##### Rightmove")
 
-        # Initialise / clamp BEFORE widget creation
-        cur_min = st.session_state.get("rm_price_min")
-        cur_max = st.session_state.get("rm_price_max")
-
-        if cur_min is None or cur_min <= 0 or cur_min < pmin_data or cur_min > pmax_data:
-            st.session_state["rm_price_min"] = int(pmin_data)
-        if cur_max is None or cur_max <= 0 or cur_max > pmax_data or cur_max < pmin_data:
-            st.session_state["rm_price_max"] = int(pmax_data)
-
-        pcol1, pcol2 = st.sidebar.columns(2)
-        with pcol1:
-            st.number_input("Min price (£)", min_value=0, step=1000, key="rm_price_min")
-        with pcol2:
-            st.number_input("Max price (£)", min_value=0, step=1000, key="rm_price_max")
-
-        lo = float(st.session_state["rm_price_min"])
-        hi = float(st.session_state["rm_price_max"])
-        if hi < lo:
-            lo, hi = hi, lo
-
-        filtered_rm = filtered_rm[filtered_rm["price_num"].between(lo, hi)]
-
-    # Outcodes with Select all / Clear all — FIXED
-    if "outcode" in sr_offer_df.columns:
-        outcodes = sorted(sr_offer_df["outcode"].dropna().unique().tolist())
-        if outcodes:
-            st.sidebar.markdown("**Outcode**")
-            c1, c2 = st.sidebar.columns(2)
-
-            if c1.button("Select all", key="sr_oc_select_all"):
-                st.session_state["sr_outcodes"] = outcodes.copy()
-                st.rerun()
-
-            if c2.button("Clear all", key="sr_oc_clear_all"):
-                st.session_state["sr_outcodes"] = []
-                st.rerun()
-
-            selected_outcodes = st.sidebar.multiselect(
-                " ",
-                options=outcodes,
-                default=st.session_state["sr_outcodes"],
-                label_visibility="collapsed",
+        if rm_df is not None and "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
+            pmin = int(rm_df["price_num"].min())
+            pmax = int(rm_df["price_num"].max())
+            _saved = st.session_state.get("rm_price_range")
+            _default = (
+                (max(pmin, int(_saved[0])), min(pmax, int(_saved[1])))
+                if _saved and len(_saved) == 2
+                else (pmin, pmax)
             )
+            filtered_rm = filtered_rm[
+                filtered_rm["price_num"].between(
+                    *st.slider(
+                        "Price (£)", pmin, pmax, _default,
+                        step=max(1000, (pmax - pmin) // 200),
+                        format="£%d",
+                        key="rm_price_range",
+                    )
+                )
+            ]
 
-            if selected_outcodes:
-                filtered_sr_offer = filtered_sr_offer[
-                    filtered_sr_offer["outcode"].isin(selected_outcodes)
-                ]
+        if rm_df is not None and "bedrooms_num" in rm_df.columns and rm_df["bedrooms_num"].notna().any():
+            bmin = int(rm_df["bedrooms_num"].min())
+            bmax = int(rm_df["bedrooms_num"].max())
+            _saved = st.session_state.get("rm_beds_range")
+            _default = (
+                (max(bmin, int(_saved[0])), min(bmax, int(_saved[1])))
+                if _saved and len(_saved) == 2
+                else (bmin, bmax)
+            )
+            filtered_rm = filtered_rm[
+                filtered_rm["bedrooms_num"].between(
+                    *st.slider("Bedrooms", bmin, bmax, _default, key="rm_beds_range")
+                )
+            ]
 
-            # persist for views
-            st.session_state["sr_outcodes"] = selected_outcodes
+    # ── Column 1: Property type + auction/HMO flags ───────────────────────────
+    with fc1:
+        st.markdown("##### Type & flags")
+
+        if rm_df is not None and "property_type" in rm_df.columns:
+            _opts = sorted(
+                rm_df["property_type"].astype("string").fillna("")
+                .replace("nan", "").loc[lambda s: s.str.strip() != ""].unique().tolist()
+            )
+            if _opts:
+                if not st.session_state["rm_property_types"]:
+                    st.session_state["rm_property_types"] = _opts.copy()
+
+                _pa, _pb = st.columns(2)
+                if _pa.button("All", use_container_width=True, key="rm_pt_all"):
+                    st.session_state["rm_property_types"] = _opts.copy()
+                    st.rerun()
+                if _pb.button("Clear", use_container_width=True, key="rm_pt_clear"):
+                    st.session_state["rm_property_types"] = []
+                    st.rerun()
+
+                _sel_types = st.multiselect(
+                    "Property types", options=_opts,
+                    default=st.session_state["rm_property_types"],
+                    label_visibility="collapsed",
+                )
+                st.session_state["rm_property_types"] = _sel_types
+                if _sel_types and filtered_rm is not None:
+                    filtered_rm = filtered_rm[
+                        filtered_rm["property_type"].astype("string").isin(_sel_types)
+                    ]
+
+        if rm_df is not None:
+            _fa, _fb = st.columns(2)
+            if "potential_auction" in rm_df.columns:
+                if _fa.checkbox("Auction only", key="rm_potential_auction"):
+                    filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_auction"])]
+            if "potential_hmo" in rm_df.columns:
+                if _fb.checkbox("HMO only", key="rm_potential_hmo"):
+                    filtered_rm = filtered_rm[_to_bool(filtered_rm["potential_hmo"])]
+
+    # ── Column 2: SpareRoom offered ───────────────────────────────────────────
+    with fc2:
+        st.markdown("##### SpareRoom Offered")
+
+        if (
+            sr_offer_df is not None
+            and "price_num" in sr_offer_df.columns
+            and sr_offer_df["price_num"].notna().any()
+        ):
+            pmin = int(sr_offer_df["price_num"].min())
+            pmax = int(sr_offer_df["price_num"].max())
+            _saved = st.session_state.get("sr_price_range")
+            _default = (
+                (max(pmin, int(_saved[0])), min(pmax, int(_saved[1])))
+                if _saved and len(_saved) == 2
+                else (pmin, pmax)
+            )
+            filtered_sr_offer = filtered_sr_offer[
+                filtered_sr_offer["price_num"].between(
+                    *st.slider(
+                        "Rent (£)", pmin, pmax, _default,
+                        step=max(50, (pmax - pmin) // 200),
+                        format="£%d",
+                        key="sr_price_range",
+                    )
+                )
+            ]
+
+        if sr_offer_df is not None and "outcode" in sr_offer_df.columns:
+            _ocs = sorted(sr_offer_df["outcode"].dropna().unique().tolist())
+            if _ocs:
+                _oa, _ob = st.columns(2)
+                if _oa.button("All", use_container_width=True, key="sr_oc_all"):
+                    st.session_state["sr_outcodes"] = _ocs.copy()
+                    st.rerun()
+                if _ob.button("Clear", use_container_width=True, key="sr_oc_clear"):
+                    st.session_state["sr_outcodes"] = []
+                    st.rerun()
+
+                _sel_ocs = st.multiselect(
+                    "Outcodes", options=_ocs,
+                    default=st.session_state["sr_outcodes"],
+                    label_visibility="collapsed",
+                )
+                st.session_state["sr_outcodes"] = _sel_ocs
+                if _sel_ocs and filtered_sr_offer is not None:
+                    filtered_sr_offer = filtered_sr_offer[
+                        filtered_sr_offer["outcode"].isin(_sel_ocs)
+                    ]
+
+# Drop rows without coordinates before passing to map
+if filtered_rm is not None and {"lat_num", "lon_num"}.issubset(filtered_rm.columns):
+    filtered_rm = filtered_rm.dropna(subset=["lat_num", "lon_num"])
+if filtered_sr_offer is not None and {"lat_num", "lon_num"}.issubset(filtered_sr_offer.columns):
+    filtered_sr_offer = filtered_sr_offer.dropna(subset=["lat_num", "lon_num"])
 
 
-    # only plot mappable rows
-    if {"lat_num", "lon_num"}.issubset(filtered_sr_offer.columns):
-        filtered_sr_offer = filtered_sr_offer.dropna(subset=["lat_num", "lon_num"])
+# ----------------------------
+# MAP HEADER
+# ----------------------------
+_hc1, _hc2 = st.columns([4, 1])
+rm_count = len(filtered_rm) if filtered_rm is not None else 0
+sr_count = len(filtered_sr_offer) if filtered_sr_offer is not None else 0
+
+with _hc1:
+    st.caption(
+        f"🔴 Rightmove **{rm_count:,}** matching &nbsp;|&nbsp; "
+        f"🔵 SpareRoom Offered **{sr_count:,}** matching"
+    )
+with _hc2:
+    max_points_each = st.select_slider(
+        "Max points/layer",
+        options=[500, 1000, 2000, 3000, 5000, 8000],
+        value=3000,
+        label_visibility="collapsed",
+    )
 
 
 # ----------------------------
 # MAP
 # ----------------------------
-st.subheader("Map")
-rm_count = len(filtered_rm) if filtered_rm is not None else 0
-sr_count = len(filtered_sr_offer) if filtered_sr_offer is not None else 0
-st.caption(f"Rightmove: {rm_count:,} | SpareRoom Offered: {sr_count:,}")
-
 m = build_map(
     center=st.session_state.map_center,
     zoom=st.session_state.map_zoom,
@@ -728,14 +621,7 @@ m = build_map(
     sr_offer_df=filtered_sr_offer,
     max_points_each=max_points_each,
 )
-
-st_folium(
-    m,
-    height=520,
-    use_container_width=True,
-    key="map_view",
-    returned_objects=[],
-)
+st_folium(m, height=540, use_container_width=True, key="map_view", returned_objects=[])
 
 st.divider()
 
@@ -743,84 +629,66 @@ st.divider()
 # ----------------------------
 # TABLES
 # ----------------------------
-col1, col2 = st.columns([1.25, 1])
+col1, col2 = st.columns([1.3, 1])
 
 with col1:
-    st.subheader("Rightmove Properties")
-
+    st.subheader("Rightmove listings")
     if rm_df is None:
-        st.info("Load Rightmove to enable selection + postcode filtering.")
+        st.info("Load Rightmove data to see listings here.")
     else:
-        show_cols = [
-            "address", "postcode", "price", "bedrooms", "property_type",
-            "potential_auction", "potential_hmo",
-            "url",
-        ] 
-        show_cols = [c for c in show_cols if c in filtered_rm.columns]
-
-        table_df = filtered_rm.reset_index(drop=True)
-        event = st.dataframe(
-            table_df[show_cols] if show_cols else table_df,
+        _show = [
+            c for c in
+            ["address", "postcode", "price", "bedrooms", "property_type",
+             "potential_auction", "potential_hmo", "url"]
+            if c in (filtered_rm.columns if filtered_rm is not None else [])
+        ]
+        _table = (filtered_rm if filtered_rm is not None else pd.DataFrame()).reset_index(drop=True)
+        _event = st.dataframe(
+            _table[_show] if _show else _table,
             use_container_width=True,
             hide_index=True,
             selection_mode="single-row",
             on_select="rerun",
             key="rm_table",
-            column_config={
-                "url": st.column_config.LinkColumn(
-                    "URL",
-                    display_text="Open",
-                ),
-            },
+            column_config={"url": st.column_config.LinkColumn("URL", display_text="Open")},
         )
 
-        selected_rows = []
-        if isinstance(event, dict):
-            selected_rows = event.get("selection", {}).get("rows", [])
+        _sel_rows = []
+        if isinstance(_event, dict):
+            _sel_rows = _event.get("selection", {}).get("rows", [])
         else:
-            state_val = st.session_state.get("rm_table")
-            if isinstance(state_val, dict):
-                selected_rows = state_val.get("selection", {}).get("rows", [])
+            _sv = st.session_state.get("rm_table")
+            if isinstance(_sv, dict):
+                _sel_rows = _sv.get("selection", {}).get("rows", [])
 
-        if selected_rows:
-            idx = selected_rows[0]
-            row = table_df.iloc[idx]
-
-            if "lat_num" in table_df.columns and "lon_num" in table_df.columns:
-                lat = row.get("lat_num")
-                lon = row.get("lon_num")
-                if pd.notna(lat) and pd.notna(lon):
-                    st.session_state.map_center = [float(lat), float(lon)]
-                    st.session_state.map_zoom = DETAIL_ZOOM
-
-            outcode = None
-            if "postcode" in table_df.columns and pd.notna(row.get("postcode")):
-                outcode = str(row.get("postcode")).strip().upper().split()[0]
-            st.session_state.selected_outcode = outcode
-
-            st.success(f"Selected: {row.get('address','(no address)')}  |  Outcode: {outcode or 'n/a'}")
+        if _sel_rows:
+            _row = _table.iloc[_sel_rows[0]]
+            if "lat_num" in _table.columns and pd.notna(_row.get("lat_num")):
+                st.session_state.map_center = [float(_row["lat_num"]), float(_row["lon_num"])]
+                st.session_state.map_zoom = DETAIL_ZOOM
+            _outcode = None
+            if "postcode" in _table.columns and pd.notna(_row.get("postcode")):
+                _outcode = str(_row["postcode"]).strip().upper().split()[0]
+            st.session_state.selected_outcode = _outcode
+            st.success(
+                f"**{_row.get('address', '(no address)')}** &nbsp;|&nbsp; Outcode: {_outcode or 'n/a'}"
+            )
 
 with col2:
-    st.subheader("SpareRoom Wanted (filtered by outcode)")
-
+    st.subheader("SpareRoom Wanted")
     if sr_wanted_df is None:
-        st.info("Load SpareRoom Wanted to see this table.")
+        st.info("Load SpareRoom Wanted data to see this table.")
     else:
-        wanted = sr_wanted_df.copy()
+        _wanted = sr_wanted_df
+        _outcode = st.session_state.selected_outcode
+        if _outcode and "outcode" in _wanted.columns:
+            _wanted = _wanted[_wanted["outcode"] == _outcode]
 
-        outcode = st.session_state.selected_outcode
-        if outcode and "outcode" in wanted.columns:
-            wanted = wanted[wanted["outcode"] == outcode]
-
-        st.caption(f"Showing {len(wanted):,} wanted-room rows" + (f" for outcode **{outcode}**" if outcode else ""))
-
-        wanted_cols_pref = ["title", "postcode", "location", "budget", "price", "rent", "bedrooms", "move_in", "url"]
-        wanted_cols = [c for c in wanted_cols_pref if c in wanted.columns]
-        if not wanted_cols:
-            wanted_cols = list(wanted.columns)[:10]
-
-        st.dataframe(
-            wanted[wanted_cols],
-            use_container_width=True,
-            hide_index=True,
+        st.caption(
+            f"{len(_wanted):,} rows"
+            + (f" for outcode **{_outcode}**" if _outcode else " — select a row on the left to filter")
         )
+        _wcols_pref = ["title", "postcode", "location", "budget", "price", "rent",
+                       "bedrooms", "move_in", "url"]
+        _wcols = [c for c in _wcols_pref if c in _wanted.columns] or list(_wanted.columns)[:10]
+        st.dataframe(_wanted[_wcols], use_container_width=True, hide_index=True)
