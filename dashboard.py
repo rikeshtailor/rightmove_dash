@@ -104,8 +104,15 @@ def _slider_default(saved, lo_bound: int, hi_bound: int) -> tuple:
 # ----------------------------
 def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
     m = folium.Map(
-        location=center, zoom_start=zoom, tiles="CartoDB positron", control_scale=True
+        location=center,
+        zoom_start=zoom,
+        min_zoom=5,
+        tiles="CartoDB positron",
+        control_scale=True,
     )
+    # Restrict panning/zooming to UK region
+    m.options["maxBounds"] = [[49.0, -9.5], [61.5, 3.5]]
+    m.options["maxBoundsViscosity"] = 1.0
 
     def _add_layer(df, name: str, color: str, with_popup: bool = True):
         if df is None or df.empty:
@@ -471,8 +478,11 @@ with st.expander("🔍 Filters", expanded=True):
         st.markdown("##### Rightmove")
 
         if rm_df is not None and "price_num" in rm_df.columns and rm_df["price_num"].notna().any():
-            pmin = int(rm_df["price_num"].min())
-            pmax = int(rm_df["price_num"].max())
+            _prices = rm_df["price_num"].dropna()
+            pmin = int(_prices.quantile(0.02))
+            pmax = int(_prices.quantile(0.98))
+            if pmin >= pmax:  # fallback if percentiles collapse (very small dataset)
+                pmin, pmax = int(_prices.min()), int(_prices.max())
             if pmin < pmax:
                 _default = _slider_default(st.session_state.get("rm_price_range"), pmin, pmax)
                 filtered_rm = filtered_rm[
@@ -485,12 +495,16 @@ with st.expander("🔍 Filters", expanded=True):
                         )
                     )
                 ]
+                st.caption(f"Full range: £{int(_prices.min()):,} – £{int(_prices.max()):,}")
             else:
                 st.caption(f"Price: £{pmin:,}")
 
         if rm_df is not None and "bedrooms_num" in rm_df.columns and rm_df["bedrooms_num"].notna().any():
-            bmin = int(rm_df["bedrooms_num"].min())
-            bmax = int(rm_df["bedrooms_num"].max())
+            _beds = rm_df["bedrooms_num"].dropna()
+            bmin = int(_beds.quantile(0.02))
+            bmax = int(_beds.quantile(0.98))
+            if bmin >= bmax:
+                bmin, bmax = int(_beds.min()), int(_beds.max())
             if bmin < bmax:
                 _default = _slider_default(st.session_state.get("rm_beds_range"), bmin, bmax)
                 filtered_rm = filtered_rm[
@@ -498,6 +512,7 @@ with st.expander("🔍 Filters", expanded=True):
                         *st.slider("Bedrooms", bmin, bmax, _default, key="rm_beds_range")
                     )
                 ]
+                st.caption(f"Full range: {int(_beds.min())} – {int(_beds.max())}")
             else:
                 st.caption(f"Bedrooms: {bmin}")
 
@@ -551,8 +566,11 @@ with st.expander("🔍 Filters", expanded=True):
             and "price_num" in sr_offer_df.columns
             and sr_offer_df["price_num"].notna().any()
         ):
-            pmin = int(sr_offer_df["price_num"].min())
-            pmax = int(sr_offer_df["price_num"].max())
+            _rents = sr_offer_df["price_num"].dropna()
+            pmin = int(_rents.quantile(0.02))
+            pmax = int(_rents.quantile(0.98))
+            if pmin >= pmax:
+                pmin, pmax = int(_rents.min()), int(_rents.max())
             if pmin < pmax:
                 _default = _slider_default(st.session_state.get("sr_price_range"), pmin, pmax)
                 filtered_sr_offer = filtered_sr_offer[
@@ -565,6 +583,7 @@ with st.expander("🔍 Filters", expanded=True):
                         )
                     )
                 ]
+                st.caption(f"Full range: £{int(_rents.min()):,} – £{int(_rents.max()):,}")
             else:
                 st.caption(f"Rent: £{pmin:,}")
 
