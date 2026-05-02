@@ -11,11 +11,13 @@ on:
         description: "Rebuild parquet from all collected URLs"
         type: boolean
         default: false
+  schedule:
+    - cron: "0 */3 * * *"  # auto-continue every 3 hours
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6-hour cap
+    timeout-minutes: 150  # 2.5 hours — leaves buffer for setup + commit, ~11 runs/month
 
     steps:
       - name: Checkout repo
@@ -28,33 +30,22 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install playwright aiohttp pandas pyarrow
-
-      - name: Install Playwright Chromium
-        run: playwright install chromium --with-deps
+        run: pip install aiohttp pandas pyarrow
 
       - name: Run scraper
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
         run: |
-          ARGS=""
+          ARGS="--time-limit 130"
           if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
           if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
-          python scraper_optimized_v4.py $ARGS
-
-      - name: Upload parquet output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: parquet-${{ github.run_number }}
-          path: parquet/
-          retention-days: 30
+          python scraper_alternative.py $ARGS
 
       - name: Commit state.json (for resume support)
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json parquet/ || true
+          git add state.json data/ || true
           git diff --cached --quiet || git commit -m "chore: update scraper state [run ${{ github.run_number }}]"
           git push
