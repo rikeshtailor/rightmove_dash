@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "0 */3 * * *"  # auto-continue every 3 hours
+    - cron: "0 6 * * 1,4"  # every Monday and Thursday at 06:00 UTC
 
 jobs:
   scrape:
