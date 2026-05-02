@@ -633,7 +633,19 @@ def consolidate_shards(shard_dir, output_path):
         print("No shards to consolidate.")
         return
     print(f"\nConsolidating {len(shard_files)} shards -> {output_path}")
-    schemas = [pq.read_schema(f) for f in shard_files]
+
+    # Numeric columns drift between int64 and float64 when a shard contains
+    # only nulls (pandas stores NaN as float). Force them to a fixed type.
+    FORCE_TYPES = {"status": pa.int64(), "price": pa.int64(), "bedrooms": pa.int64()}
+
+    def normalise(schema):
+        return pa.schema([
+            pa.field(f.name, FORCE_TYPES[f.name], nullable=True)
+            if f.name in FORCE_TYPES else f
+            for f in schema
+        ])
+
+    schemas = [normalise(pq.read_schema(f)) for f in shard_files]
     unified = pa.unify_schemas(schemas, promote_options="default")
     writer  = None
     total_rows = 0
@@ -664,11 +676,17 @@ def flush_shard(rows, shard_dir, shard_index):
 # ============================================================
 
 def clear_state():
-    """Reset state.json so the next run starts fresh."""
+    """Reset state.json and remove all parquet shards."""
     empty = {"completed_outcodes": [], "collected_urls": [], "seen_urls": []}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(empty, f, indent=2)
     print("State cleared.")
+
+    shards_root = PARQUET_DIR / "shards"
+    if shards_root.exists():
+        import shutil
+        shutil.rmtree(shards_root)
+        print(f"Shards directory removed.")
 
 
 def push_to_github(parquet_path: Path):
