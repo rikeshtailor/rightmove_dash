@@ -1,0 +1,60 @@
+name: Rightmove Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      retry_failed:
+        description: "Retry previously failed URLs"
+        type: boolean
+        default: false
+      rebuild_from_all:
+        description: "Rebuild parquet from all collected URLs"
+        type: boolean
+        default: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6-hour cap
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install playwright aiohttp pandas pyarrow
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
+        run: |
+          ARGS=""
+          if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
+          if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
+          python scraper_optimized_v4.py $ARGS
+
+      - name: Upload parquet output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-${{ github.run_number }}
+          path: parquet/
+          retention-days: 30
+
+      - name: Commit state.json (for resume support)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json parquet/ || true
+          git diff --cached --quiet || git commit -m "chore: update scraper state [run ${{ github.run_number }}]"
+          git push
