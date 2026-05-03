@@ -48,7 +48,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
           git add state.json data/ || true
+          git pull --rebase
           git diff --cached --quiet || git commit -m "chore: update scraper state [run ${{ github.run_number }}]"
           git push
