@@ -43,3 +43,12 @@ jobs:
           if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
           python scraper_alternative.py $ARGS
 
+      - name: Push parquet to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ || true
+          git diff --cached --quiet && echo "No parquet to push." && exit 0
+          git commit -m "data: scrape $(date +'%Y-%m-%d')"
+          git push
+

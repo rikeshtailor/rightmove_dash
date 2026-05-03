@@ -767,9 +767,13 @@ async def run():
     # Only clean state + push if every URL was scraped (no pending left)
     still_pending = len(state["collected_urls"] - state["seen_urls"])
     if still_pending == 0:
-        print("\nAll URLs scraped — clearing state and pushing to GitHub.")
         clear_state()
-        push_to_github(output)
+        # On GitHub Actions the workflow step handles the push
+        if os.environ.get("GITHUB_ACTIONS"):
+            print("\nAll URLs scraped — state cleared. Workflow will push parquet.")
+        else:
+            print("\nAll URLs scraped — clearing state and pushing to GitHub.")
+            push_to_github(output)
     else:
         print(f"\n{still_pending:,} URLs still pending — state kept for resume.")
 
