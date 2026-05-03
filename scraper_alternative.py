@@ -634,32 +634,12 @@ def consolidate_shards(shard_dir, output_path):
         return
     print(f"\nConsolidating {len(shard_files)} shards -> {output_path}")
 
-    # Numeric columns drift between int64 and float64 when a shard contains
-    # only nulls (pandas stores NaN as float). Force them to a fixed type.
-    FORCE_TYPES = {"status": pa.int64(), "price": pa.int64(), "bedrooms": pa.int64()}
-
-    def normalise(schema):
-        return pa.schema([
-            pa.field(f.name, FORCE_TYPES[f.name], nullable=True)
-            if f.name in FORCE_TYPES else f
-            for f in schema
-        ])
-
-    schemas = [normalise(pq.read_schema(f)) for f in shard_files]
-    unified = pa.unify_schemas(schemas, promote_options="default")
-    writer  = None
-    total_rows = 0
-    try:
-        for f in shard_files:
-            table = pq.read_table(f).cast(unified)
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, unified, compression="snappy")
-            writer.write_table(table)
-            total_rows += len(table)
-    finally:
-        if writer:
-            writer.close()
-    print(f"{total_rows:,} rows written to {output_path}")
+    df = pd.concat(
+        [pd.read_parquet(f) for f in shard_files],
+        ignore_index=True,
+    )
+    df.to_parquet(output_path, index=False, compression="snappy")
+    print(f"{len(df):,} rows written to {output_path}")
 
 
 def flush_shard(rows, shard_dir, shard_index):
