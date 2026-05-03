@@ -418,6 +418,47 @@ else:
 st.sidebar.divider()
 
 # ----------------------------
+# SIDEBAR: DOWNLOADS
+# ----------------------------
+def _df_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    import io
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False, compression="snappy")
+    return buf.getvalue()
+
+_dl_datasets = {
+    "Rightmove":         st.session_state.rm_df,
+    "SpareRoom Offered": st.session_state.sr_offer_df,
+    "SpareRoom Wanted":  st.session_state.sr_wanted_df,
+}
+_loaded = {k: v for k, v in _dl_datasets.items() if v is not None}
+
+if _loaded:
+    st.sidebar.subheader("Download data")
+    for _ds_name, _ds_df in _loaded.items():
+        _slug = _ds_name.lower().replace(" ", "_")
+        st.sidebar.caption(f"**{_ds_name}** — {len(_ds_df):,} rows")
+        _dlc1, _dlc2 = st.sidebar.columns(2)
+        _dlc1.download_button(
+            label="Parquet",
+            data=_df_to_parquet_bytes(_ds_df),
+            file_name=f"{_slug}.parquet",
+            mime="application/octet-stream",
+            use_container_width=True,
+            key=f"dl_parquet_{_slug}",
+        )
+        _dlc2.download_button(
+            label="CSV",
+            data=_ds_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{_slug}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"dl_csv_{_slug}",
+        )
+
+st.sidebar.divider()
+
+# ----------------------------
 # SIDEBAR: VIEWS
 # ----------------------------
 st.sidebar.subheader("Saved views")
