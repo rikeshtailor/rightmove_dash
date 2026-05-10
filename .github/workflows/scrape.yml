@@ -15,14 +15,6 @@ on:
         description: "Analysis and email only (no scraping)"
         type: boolean
         default: false
-      retry_failed:
-        description: "Retry previously failed Rightmove URLs"
-        type: boolean
-        default: false
-      rebuild_from_all:
-        description: "Rebuild Rightmove parquet from all collected URLs"
-        type: boolean
-        default: false
   schedule:
     - cron: "0 6 * * 1"  # every Monday at 06:00 UTC
 
@@ -51,10 +43,7 @@ jobs:
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
         run: |
-          ARGS="--scrape-only --time-limit 130"
-          if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
-          if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
-          python scraper_alternative.py $ARGS
+          python scraper_alternative.py --scrape-only --time-limit 130
 
       - name: Push Rightmove parquet to repo
         if: ${{ inputs.spareroom_only != true && inputs.analyse_only != true }}
