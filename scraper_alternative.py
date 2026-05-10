@@ -37,6 +37,13 @@ try:
 except ImportError:
     _BS4_AVAILABLE = False
 
+try:
+    from shapely.geometry import shape, Point
+    from shapely.strtree import STRtree
+    _SHAPELY_AVAILABLE = True
+except ImportError:
+    _SHAPELY_AVAILABLE = False
+
 # ============================================================
 # CLI FLAGS
 # ============================================================
@@ -70,6 +77,9 @@ def time_is_up() -> bool:
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+
+ARTICLE4_PARQUET      = DATA_DIR / "article4_areas.parquet"
+ARTICLE4_MAX_AGE_DAYS = 7
 
 SHARD_ROWS = 5000
 STATE_FILE = BASE_DIR / "state.json"
@@ -1381,6 +1391,132 @@ async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
 
 
 # ============================================================
+# ARTICLE 4 DIRECTION AREAS
+# ============================================================
+
+def fetch_article4_areas() -> pd.DataFrame:
+    """
+    Download all Article 4 direction areas from planning.data.gov.uk and
+    cache them to data/article4_areas.parquet.  Cache is reused for 7 days.
+    Returns a DataFrame with columns: entity, name, reference, geometry_json, point_wkt.
+    """
+    import urllib.request
+    import urllib.parse
+
+    if ARTICLE4_PARQUET.exists():
+        age_days = (time.time() - ARTICLE4_PARQUET.stat().st_mtime) / 86400
+        if age_days < ARTICLE4_MAX_AGE_DAYS:
+            print(f"Article 4 cache is {age_days:.1f} days old — loading from parquet.")
+            return pd.read_parquet(ARTICLE4_PARQUET)
+
+    print("Fetching Article 4 direction areas from planning.data.gov.uk ...")
+    base_url = "https://www.planning.data.gov.uk/entity.json"
+    limit    = 500
+    offset   = 0
+    all_rows: list[dict] = []
+
+    while True:
+        params = urllib.parse.urlencode({
+            "dataset": "article-4-direction-area",
+            "limit":   limit,
+            "offset":  offset,
+        })
+        try:
+            with urllib.request.urlopen(f"{base_url}?{params}", timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as exc:
+            print(f"\nArticle 4 API error at offset {offset}: {exc}")
+            break
+
+        entities = data.get("entities", [])
+        if not entities:
+            break
+
+        for ent in entities:
+            geom = ent.get("geometry")
+            all_rows.append({
+                "entity":        ent.get("entity"),
+                "name":          ent.get("name") or "",
+                "reference":     ent.get("reference") or "",
+                "geometry_json": json.dumps(geom) if geom else None,
+                "point_wkt":     ent.get("point") or "",
+            })
+
+        print(f"  Fetched {len(all_rows):,} areas...", end="\r", flush=True)
+        if len(entities) < limit:
+            break
+        offset += limit
+
+    print(f"\nFetched {len(all_rows):,} Article 4 direction areas total.")
+
+    if not all_rows:
+        empty = pd.DataFrame(columns=["entity", "name", "reference", "geometry_json", "point_wkt"])
+        return empty
+
+    df = pd.DataFrame(all_rows)
+    df.to_parquet(ARTICLE4_PARQUET, index=False, compression="snappy")
+    print(f"Saved Article 4 areas -> {ARTICLE4_PARQUET.name}")
+    return df
+
+
+def build_article4_index(df: pd.DataFrame):
+    """
+    Build a shapely STRtree spatial index from Article 4 MultiPolygon geometries.
+    Returns (STRtree, list[geom]) or (None, []) if shapely is unavailable.
+    """
+    if not _SHAPELY_AVAILABLE:
+        print("shapely not installed — Article 4 filtering disabled. Run: pip install shapely")
+        return None, []
+
+    if df.empty:
+        return None, []
+
+    geoms: list = []
+    for geom_json in df["geometry_json"].dropna():
+        try:
+            geom_dict = json.loads(geom_json)
+            if geom_dict:
+                geoms.append(shape(geom_dict))
+        except Exception:
+            pass
+
+    if not geoms:
+        return None, []
+
+    tree = STRtree(geoms)
+    print(f"Article 4 spatial index built — {len(geoms):,} polygons")
+    return tree, geoms
+
+
+def is_in_article4(lat: float, lon: float, tree, geoms: list) -> bool:
+    """Return True if (lat, lon) falls inside any Article 4 direction area polygon."""
+    if tree is None or not geoms:
+        return False
+    pt = Point(lon, lat)  # shapely uses (x=lon, y=lat)
+    for candidate in tree.query(pt):
+        try:
+            geom = geoms[int(candidate)]
+        except (TypeError, ValueError):
+            geom = candidate
+        if geom.contains(pt):
+            return True
+    return False
+
+
+def _flag_article4(df: pd.DataFrame, tree, geoms: list) -> pd.Series:
+    """Return a boolean Series indicating which rows fall inside Article 4 areas."""
+    flags = []
+    for _, row in df.iterrows():
+        lat = _safe_float(row.get("latitude"))
+        lon = _safe_float(row.get("longitude"))
+        if lat is None or lon is None:
+            flags.append(False)
+        else:
+            flags.append(is_in_article4(lat, lon, tree, geoms))
+    return pd.Series(flags, index=df.index, dtype=bool)
+
+
+# ============================================================
 # HMO ANALYSIS & EMAIL
 # ============================================================
 
@@ -1475,6 +1611,17 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         df["is_house"] &
         (~df["potential_hmo"].fillna(False))
     ].copy()
+
+    # Article 4 filter — exclude properties in restricted areas
+    a4_df   = fetch_article4_areas()
+    a4_tree, a4_geoms = build_article4_index(a4_df)
+    a4_excluded = 0
+    if a4_tree is not None and not hmo_candidates.empty:
+        print("Checking Article 4 restrictions ...")
+        hmo_candidates["in_article4"] = _flag_article4(hmo_candidates, a4_tree, a4_geoms)
+        a4_excluded = int(hmo_candidates["in_article4"].sum())
+        print(f"  Excluded {a4_excluded:,} candidates in Article 4 restricted areas")
+        hmo_candidates = hmo_candidates[~hmo_candidates["in_article4"]].copy()
 
     five_plus = df[df["beds_num"] >= 5].copy()
 
@@ -1587,6 +1734,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         "five_plus":      five_plus,
         "affordable":     affordable,
         "hotspots":       hotspots,
+        "a4_excluded":    a4_excluded,
     }
 
 
@@ -1605,6 +1753,8 @@ def print_metrics_report(analysis: dict) -> None:
     print("=" * 72)
     print(f"  Total properties scraped      : {analysis['total']:>8,}")
     print(f"  HMO conversion candidates     : {len(cands):>8,}  (3+ bed house, non-HMO)")
+    if analysis.get("a4_excluded", 0) > 0:
+        print(f"  Article 4 excluded            : {analysis['a4_excluded']:>8,}  (planning restriction)")
     print(f"    Under £{HMO_PRICE_THRESHOLD:,}               : {len(aff):>8,}")
     print(f"    £{HMO_PRICE_THRESHOLD:,} - £350,000          : {band_mid:>8,}")
     print(f"    Over £350,000                : {band_high:>8,}")
@@ -1692,7 +1842,9 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
   HMO Opportunity Report &mdash; {date_str}
 </h2>
 <p>HMO conversion candidates (3+ bed house, not already HMO) priced under
-<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties sorted by area score then price.</p>
+<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties sorted by area score then price.
+Properties in <b>Article 4 direction areas</b> (planning permission required for HMO conversion)
+have been excluded from this report.</p>
 <p><b>{len(affordable):,} total candidates</b> — showing top 100.</p>
 
 <h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>

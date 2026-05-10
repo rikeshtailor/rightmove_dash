@@ -36,7 +36,7 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install aiohttp pandas pyarrow beautifulsoup4
+        run: pip install aiohttp pandas pyarrow beautifulsoup4 shapely
 
       - name: Run scraper
         env:
