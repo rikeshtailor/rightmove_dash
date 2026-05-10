@@ -58,13 +58,10 @@ jobs:
           git commit -m "data: scrape $(date +'%Y-%m-%d')"
           git push
 
-      - name: Run SpareRoom + analysis + email
+      - name: Run SpareRoom scrape
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
-        run: python scraper_alternative.py --analyse-only
+        run: python scraper_alternative.py --spareroom-only
 
       - name: Push SpareRoom data to repo
         if: always()
@@ -76,3 +73,11 @@ jobs:
           git diff --cached --quiet && echo "No SpareRoom data to push." && exit 0
           git commit -m "data: spareroom $(date +'%Y-%m-%d')"
           git push
+
+      - name: Run analysis and send email
+        env:
+          OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
+        run: python scraper_alternative.py --analyse-only

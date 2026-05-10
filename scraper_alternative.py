@@ -2335,11 +2335,7 @@ async def run():
 
 
 def run_analyse_only():
-    """SpareRoom scrape + HMO analysis on the most recent Rightmove parquet."""
-    asyncio.run(run_spareroom("offered", retry_failed=RETRY_FAILED))
-    if not IS_CI:
-        asyncio.run(run_spareroom("wanted", retry_failed=RETRY_FAILED))
-
+    """HMO analysis on the most recent Rightmove parquet + send email."""
     parquets = sorted(
         DATA_DIR.glob("rightmove_*.parquet"),
         key=lambda p: p.stat().st_mtime, reverse=True,
@@ -2388,7 +2384,8 @@ if __name__ == "__main__":
         run_analyse_only()
     elif SPAREROOM_ONLY:
         asyncio.run(run_spareroom("offered", retry_failed=RETRY_FAILED))
-        asyncio.run(run_spareroom("wanted",  retry_failed=RETRY_FAILED))
+        if not IS_CI:
+            asyncio.run(run_spareroom("wanted", retry_failed=RETRY_FAILED))
     elif RETRY_FAILED and not RIGHTMOVE_ONLY:
         asyncio.run(run_retry_failed())
     else:
