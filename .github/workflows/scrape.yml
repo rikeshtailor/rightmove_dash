@@ -39,20 +39,14 @@ jobs:
         run: pip install aiohttp pandas pyarrow beautifulsoup4 shapely
 
       - name: Run scraper
+        if: ${{ inputs.analyse_only != true }}
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
         run: |
-          if [ "${{ inputs.analyse_only }}" = "true" ]; then
-            python scraper_alternative.py --analyse-only
-          else
-            ARGS="--time-limit 130"
-            if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
-            if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
-            python scraper_alternative.py $ARGS
-          fi
+          ARGS="--scrape-only --time-limit 130"
+          if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
+          if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
+          python scraper_alternative.py $ARGS
 
       - name: Push parquet to repo
         if: ${{ inputs.analyse_only != true }}
@@ -64,3 +58,10 @@ jobs:
           git commit -m "data: scrape $(date +'%Y-%m-%d')"
           git push
 
+      - name: Run SpareRoom + analysis + email
+        env:
+          OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
+        run: python scraper_alternative.py --analyse-only

@@ -50,6 +50,7 @@ IS_CI            = bool(os.environ.get("GITHUB_ACTIONS"))
 RETRY_FAILED     = "--retry-failed"     in sys.argv
 REBUILD_FROM_ALL = "--rebuild-from-all" in sys.argv
 ANALYSE_ONLY     = "--analyse-only"     in sys.argv
+SCRAPE_ONLY      = "--scrape-only"      in sys.argv
 RIGHTMOVE_ONLY   = "--rightmove-only"   in sys.argv
 SPAREROOM_ONLY   = "--spareroom-only"   in sys.argv
 
@@ -2250,6 +2251,11 @@ async def run():
     """Default: Rightmove + SpareRoom + analysis + email."""
     output = await run_rightmove()
 
+    if SCRAPE_ONLY:
+        if output:
+            print(f"\nScrape-only complete. Parquet written: {output}")
+        return
+
     if not RIGHTMOVE_ONLY:
         await run_spareroom("offered", retry_failed=RETRY_FAILED)
         await run_spareroom("wanted",  retry_failed=RETRY_FAILED)
@@ -2278,7 +2284,10 @@ async def run():
 
 
 def run_analyse_only():
-    """Re-run HMO analysis on the most recent Rightmove parquet without re-scraping."""
+    """SpareRoom scrape + HMO analysis on the most recent Rightmove parquet."""
+    asyncio.run(run_spareroom("offered", retry_failed=RETRY_FAILED))
+    asyncio.run(run_spareroom("wanted",  retry_failed=RETRY_FAILED))
+
     parquets = sorted(
         DATA_DIR.glob("rightmove_*.parquet"),
         key=lambda p: p.stat().st_mtime, reverse=True,
