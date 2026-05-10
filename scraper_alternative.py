@@ -450,6 +450,32 @@ OUTCODE_ROOM_RENTS: dict[str, int] = {
     "BT": 420,
 }
 
+# ── Article 4 outcode overrides ──────────────────────────────────────────────
+# Many councils with Article 4 HMO restrictions haven't submitted their
+# boundaries to the national planning register (planning.data.gov.uk).
+# List outcodes here that are known Article 4 areas to ensure they are
+# excluded even when missing from the API dataset.
+KNOWN_ARTICLE4_OUTCODES: set[str] = {
+    # Middlesbrough (council-wide HMO Article 4 – not in national register)
+    "TS1", "TS3", "TS4", "TS5",
+    # Sunderland
+    "SR1", "SR2", "SR4",
+    # Hull
+    "HU3", "HU5",
+    # Nottingham (partial – NMC Article 4 covers city centre wards)
+    "NG1", "NG7",
+    # Sheffield (parts of S1–S10 under Article 4)
+    "S1", "S2", "S3", "S6", "S10",
+    # Leeds (Hyde Park / Headingley Article 4)
+    "LS6",
+    # Liverpool (parts of L6, L7)
+    "L6", "L7",
+    # Coventry
+    "CV1",
+    # Bristol (parts of BS6, BS7)
+    "BS6", "BS7",
+}
+
 # ── Scoring breakpoints ───────────────────────────────────────────────────────
 _UNI_BP    = [(1, 10), (2, 9), (3, 8), (5, 6), (8, 4), (12, 2)]
 _HOSP_BP   = [(1, 10), (2, 8), (3, 6), (5, 4), (8, 2)]
@@ -1619,14 +1645,27 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     ].copy()
 
     # Article 4 filter — exclude properties in restricted areas
+    # Two-layer check: (1) polygon lookup against national register,
+    # (2) outcode override list for councils not yet in the register.
     a4_df   = fetch_article4_areas()
     a4_tree, a4_geoms = build_article4_index(a4_df)
     a4_excluded = 0
-    if a4_tree is not None and not hmo_candidates.empty:
-        print("Checking Article 4 restrictions ...")
-        hmo_candidates["in_article4"] = _flag_article4(hmo_candidates, a4_tree, a4_geoms)
+    if not hmo_candidates.empty:
+        # Layer 1: polygon check from national register
+        if a4_tree is not None:
+            print("Checking Article 4 restrictions (national register) ...")
+            hmo_candidates["in_article4"] = _flag_article4(hmo_candidates, a4_tree, a4_geoms)
+        else:
+            hmo_candidates["in_article4"] = False
+
+        # Layer 2: known outcode overrides (councils not in national register)
+        outcode_override = hmo_candidates["outcode"].isin(KNOWN_ARTICLE4_OUTCODES)
+        override_count   = int((outcode_override & ~hmo_candidates["in_article4"]).sum())
+        hmo_candidates["in_article4"] = hmo_candidates["in_article4"] | outcode_override
+
         a4_excluded = int(hmo_candidates["in_article4"].sum())
-        print(f"  Excluded {a4_excluded:,} candidates in Article 4 restricted areas")
+        print(f"  Excluded {a4_excluded:,} candidates in Article 4 areas"
+              f" ({override_count:,} via outcode override list)")
         hmo_candidates = hmo_candidates[~hmo_candidates["in_article4"]].copy()
 
     five_plus = df[df["beds_num"] >= 5].copy()
