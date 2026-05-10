@@ -1446,6 +1446,17 @@ def _sr_normalize(row: dict) -> dict:
     }
 
 
+def _consolidate_spareroom(flatshare_type: str, shard_dir: Path) -> None:
+    """Merge all shards for a flatshare_type into a single parquet in data/."""
+    shards = sorted(shard_dir.glob("spareroom_shard_*.parquet"))
+    if not shards:
+        return
+    out = DATA_DIR / f"spareroom_{flatshare_type}.parquet"
+    df = pd.concat([pd.read_parquet(f) for f in shards], ignore_index=True)
+    df.to_parquet(out, index=False, compression="snappy")
+    print(f"SpareRoom {flatshare_type} consolidated — {len(df):,} rows -> {out.name}")
+
+
 async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
     """Scrape SpareRoom for one flatshare_type ('offered' or 'wanted')."""
     if not Path(SPAREROOM_CSV).exists():
@@ -1548,6 +1559,7 @@ async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
     flush_batch()
     _sr_save_state(state, state_file)
     print(f"\nSpareRoom {flatshare_type} done — {total_rows:,} rows, {deduped:,} deduped")
+    _consolidate_spareroom(flatshare_type, output_dir)
 
 
 # ============================================================
@@ -1688,17 +1700,22 @@ def _flag_article4(df: pd.DataFrame, tree, geoms: list) -> pd.Series:
 
 def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
     """
-    Read SpareRoom offered-room parquet shards from data/spareroom_offered/
-    and return outcode -> median monthly rent (£).
-    Falls back to an empty dict if no data has been scraped yet.
+    Return outcode -> median monthly rent (£) from SpareRoom offered data.
+    Reads consolidated parquet if present, otherwise falls back to shards.
     """
-    offered_dir = DATA_DIR / "spareroom_offered"
-    shards = sorted(offered_dir.glob("spareroom_shard_*.parquet")) if offered_dir.exists() else []
-    if not shards:
+    consolidated = DATA_DIR / "spareroom_offered.parquet"
+    offered_dir  = DATA_DIR / "spareroom_offered"
+
+    if consolidated.exists():
+        sources = [consolidated]
+    else:
+        sources = sorted(offered_dir.glob("spareroom_shard_*.parquet")) if offered_dir.exists() else []
+
+    if not sources:
         return {}
 
     dfs = []
-    for f in shards:
+    for f in sources:
         try:
             dfs.append(pd.read_parquet(f, columns=["postcode", "pcm_price", "pw_price"]))
         except Exception:
