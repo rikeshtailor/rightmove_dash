@@ -544,6 +544,55 @@ def _safe_float(x) -> float | None:
         return None
 
 
+def _parse_floor_area_sqm(fa_str) -> float | None:
+    """Parse '120 sq m', '1,200 sq ft', '120m²' etc. into square metres."""
+    if not fa_str or str(fa_str).strip() in ("", "None", "nan"):
+        return None
+    s = str(fa_str).lower().replace(",", "")
+    m = re.search(r"([\d.]+)\s*(?:sq\.?\s*m(?:etres?)?|m²|sqm)\b", s)
+    if m:
+        v = float(m.group(1))
+        return v if 10 < v < 2_000 else None
+    m = re.search(r"([\d.]+)\s*(?:sq\.?\s*f(?:ee|oo)?t|ft²|sqft)\b", s)
+    if m:
+        v = float(m.group(1)) * 0.0929
+        return v if 10 < v < 2_000 else None
+    return None
+
+
+def _estimate_hmo_rooms(beds_num, floor_sqm) -> tuple[int, int]:
+    """
+    Return (potential_rooms, ensuite_capable_rooms).
+
+    Floor-area path (used when floor_sqm available):
+      - 35% of total area reserved for communal spaces (hallways, kitchen, bathrooms)
+      - Standard lettable HMO room: 10 sq m
+      - En-suite capable room: 14 sq m (10 sqm room + 4 sqm wet room)
+
+    Bedroom-count fallback (used when floor area not scraped):
+      - Standard UK terrace/semi has 1-2 reception rooms that can be converted
+      - En-suite: roughly 1 in 3 rooms large enough for a wet room addition
+    """
+    beds = int(beds_num) if pd.notna(beds_num) and beds_num > 0 else 3
+
+    if floor_sqm and floor_sqm > 30:
+        usable    = floor_sqm * 0.65
+        pot       = max(beds, min(int(usable / 10), beds + 4))
+        ensuite   = min(int(usable / 14), pot)
+    else:
+        # UK layout heuristic: count convertible reception rooms
+        if beds <= 3:
+            bonus = 1       # one reception → extra room
+        elif beds == 4:
+            bonus = 2       # lounge + dining → two extra rooms
+        else:
+            bonus = 1       # already large; one reception converted
+        pot     = beds + bonus
+        ensuite = max(1, pot // 3)
+
+    return pot, ensuite
+
+
 def html_to_text(s: str) -> str:
     if not s:
         return ""
@@ -1773,6 +1822,18 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable["hmo_score"] = affordable["outcode"].map(score_map)
     affordable = affordable.sort_values(["hmo_score", "price_num"], ascending=[False, True])
 
+    # Per-property HMO income estimates
+    affordable["room_rent_est"] = affordable["outcode"].apply(
+        lambda oc: int(spareroom_rents.get(oc, _get_room_rent(oc)))
+    )
+    affordable["floor_sqm"] = affordable["floor_area"].apply(_parse_floor_area_sqm)
+    _hmo_est = affordable.apply(
+        lambda r: _estimate_hmo_rooms(r["beds_num"], r["floor_sqm"]), axis=1
+    )
+    affordable["pot_rooms"]     = _hmo_est.apply(lambda x: x[0])
+    affordable["ensuite_rooms"] = _hmo_est.apply(lambda x: x[1])
+    affordable["est_monthly"]   = affordable["room_rent_est"] * affordable["pot_rooms"]
+
     return {
         "total":          len(df),
         "hmo_candidates": hmo_candidates,
@@ -1866,19 +1927,31 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
 
     property_rows = ""
     for _, r in affordable.head(100).iterrows():
-        price     = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "-"
-        beds      = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
-        addr      = r.get("address") or "View listing"
-        ptype     = r.get("property_type") or "-"
-        pc        = r.get("postcode") or "-"
-        score     = r.get("hmo_score")
-        score_str = f"{score:.1f}" if pd.notna(score) else "-"
-        flag      = " &#9873;" if r.get("potential_auction") else ""
+        price       = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "-"
+        beds        = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
+        addr        = r.get("address") or "View listing"
+        ptype       = r.get("property_type") or "-"
+        pc          = r.get("postcode") or "-"
+        score       = r.get("hmo_score")
+        score_str   = f"{score:.1f}" if pd.notna(score) else "-"
+        flag        = " &#9873;" if r.get("potential_auction") else ""
+        rr          = r.get("room_rent_est")
+        rr_str      = f"£{int(rr):,}" if pd.notna(rr) else "-"
+        pot         = r.get("pot_rooms")
+        pot_str     = str(int(pot)) if pd.notna(pot) else "-"
+        ens         = r.get("ensuite_rooms")
+        ens_str     = str(int(ens)) if pd.notna(ens) else "-"
+        monthly     = r.get("est_monthly")
+        monthly_str = f"£{int(monthly):,}" if pd.notna(monthly) else "-"
         property_rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}{flag}</a></td>"
             f"<td>{pc}</td><td>{price}</td><td>{beds}</td><td>{ptype}</td>"
             f"<td style='text-align:center'>{score_str}</td>"
+            f"<td style='text-align:center'>{rr_str}</td>"
+            f"<td style='text-align:center'>{pot_str}</td>"
+            f"<td style='text-align:center'>{ens_str}</td>"
+            f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
             f"</tr>\n"
         )
 
@@ -1911,12 +1984,16 @@ have been excluded from this report.</p>
 <h3 style="margin-top:2em;">Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}</h3>
 <p style="font-size:0.85em;color:#555;">
   Showing top 100 of {len(affordable):,} total, ranked by area score then price.
-  &#9873; = auction listing &nbsp;|&nbsp; Score = outcode composite score
+  &#9873; = auction listing &nbsp;|&nbsp; Score = outcode composite score<br>
+  <b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms (current beds + convertible receptions).
+  <b>En-suite</b> = rooms estimated large enough to add a wet room.
+  <b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. All figures are estimates only.
 </p>
 <table border="1" cellpadding="7" cellspacing="0"
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
   <tr style="background:#c0392b;color:#fff;">
-    <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th><th>Score</th>
+    <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
+    <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th><th>Est. Monthly</th>
   </tr>
   {property_rows}
 </table>
