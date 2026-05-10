@@ -118,8 +118,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121 Safari/537.36",
 ]
 
-AUCTION_RE = re.compile(r"\bauction\b", re.IGNORECASE)
-HMO_RE     = re.compile(r"\bH\.?\s*M\.?\s*O\.?\b", re.IGNORECASE)
+AUCTION_RE    = re.compile(r"\bauction\b", re.IGNORECASE)
+HMO_RE        = re.compile(r"\bH\.?\s*M\.?\s*O\.?\b", re.IGNORECASE)
+LEASEHOLD_RE  = re.compile(r"\bleasehold\b|\bshare\s+of\s+freehold\b", re.IGNORECASE)
+NEW_BUILD_RE  = re.compile(r"\bnew\s+build\b|\bnew\s+home\b|\bbrand\s+new\b", re.IGNORECASE)
 TAG_RE     = re.compile(r"<[^>]+>")
 
 
@@ -895,6 +897,8 @@ def normalize_row(url, model, status, description_text=""):
     desc = description_text or ""
     potential_auction = bool(AUCTION_RE.search(desc))
     potential_hmo     = bool(HMO_RE.search(desc))
+    desc_leasehold    = bool(LEASEHOLD_RE.search(desc))
+    desc_new_build    = bool(NEW_BUILD_RE.search(desc))
 
     _null = {
         "url": url, "address": None, "postcode": None,
@@ -905,6 +909,8 @@ def normalize_row(url, model, status, description_text=""):
         "status": int(status) if str(status).isdigit() else None,
         "potential_auction": potential_auction,
         "potential_hmo": potential_hmo,
+        "is_leasehold": desc_leasehold,
+        "is_new_build": desc_new_build,
     }
     if not model:
         return _null
@@ -934,6 +940,26 @@ def normalize_row(url, model, status, description_text=""):
 
     reception_rooms, has_ensuite = _parse_key_features(prop.get("keyFeatures"))
 
+    # Tenure — Rightmove stores as {"tenureType": "LEASEHOLD"} or plain string
+    tenure_raw  = prop.get("tenure") or analytics.get("tenure") or {}
+    tenure_type = (
+        tenure_raw.get("tenureType", "") if isinstance(tenure_raw, dict)
+        else str(tenure_raw)
+    ).upper()
+    is_leasehold = (
+        "LEASEHOLD" in tenure_type or
+        "SHARE" in tenure_type or
+        desc_leasehold
+    )
+
+    # New build — check structured tags then description
+    prop_tags   = [str(t).lower() for t in (prop.get("tags") or [])]
+    is_new_build = (
+        bool(analytics.get("isNewBuild")) or
+        any("new" in t for t in prop_tags) or
+        desc_new_build
+    )
+
     return {
         "url":               url,
         "address":           addr.get("displayAddress"),
@@ -950,6 +976,8 @@ def normalize_row(url, model, status, description_text=""):
         "status":            int(status) if str(status).isdigit() else None,
         "potential_auction": potential_auction,
         "potential_hmo":     potential_hmo,
+        "is_leasehold":      is_leasehold,
+        "is_new_build":      is_new_build,
     }
 
 
@@ -1742,7 +1770,9 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         (df["price_num"] >= 5_000) &
         df["is_house"] &
         (~df["is_land"]) &
-        (~df["potential_hmo"].fillna(False))
+        (~df["potential_hmo"].fillna(False)) &
+        (~df["is_leasehold"].fillna(False)) &
+        (~df["is_new_build"].fillna(False))
     ].copy()
 
     # Article 4 filter — exclude properties in restricted areas
