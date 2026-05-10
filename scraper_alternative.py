@@ -23,9 +23,14 @@ from multiprocessing import Process, Queue, freeze_support
 from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from math import radians, sin, cos, sqrt, atan2
 
 RETRY_FAILED     = "--retry-failed"     in sys.argv
 REBUILD_FROM_ALL = "--rebuild-from-all" in sys.argv
+ANALYSE_ONLY     = "--analyse-only"     in sys.argv
 
 # --time-limit N: exit cleanly after N minutes (for chunked CI runs)
 _time_limit_arg = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--time-limit"), None)
@@ -59,6 +64,363 @@ OUTCODE_CSV = os.environ.get(
 PAGE_SIZE   = 24
 MAX_PAGES   = 50
 
+# HMO analysis
+HMO_EMAIL_TO        = os.environ.get("HMO_EMAIL_TO", "")
+HMO_PRICE_THRESHOLD = 220_000
+# Property types that can physically be HMOs (exclude flats/maisonettes)
+_HOUSE_TYPE_PAT = r"detach|semi|terrace|bungalow|town.house|cottage|villa|barn"
+
+# ============================================================
+# REFERENCE DATA  (for HMO hotspot scoring)
+# ============================================================
+
+# (name, lat, lon)
+UK_UNIVERSITIES = [
+    # Yorkshire
+    ("University of Leeds",           53.8067, -1.5550),
+    ("Leeds Beckett University",       53.8008, -1.5531),
+    ("University of Bradford",         53.7895, -1.7527),
+    ("University of Huddersfield",     53.6462, -1.7830),
+    ("University of Sheffield",        53.3811, -1.4886),
+    ("Sheffield Hallam University",    53.3780, -1.4684),
+    ("University of York",             53.9479, -1.0498),
+    ("York St John University",        53.9618, -1.0734),
+    ("University of Hull",             53.7707, -0.3665),
+    ("Leeds Trinity University",       53.8330, -1.6340),
+    # North East
+    ("Newcastle University",           54.9788, -1.6131),
+    ("Northumbria University",         54.9786, -1.6147),
+    ("Durham University",              54.7743, -1.5756),
+    ("University of Sunderland",       54.9046, -1.3822),
+    ("Teesside University",            54.5761, -1.2295),
+    # North West
+    ("University of Manchester",       53.4668, -2.2339),
+    ("Manchester Metropolitan Univ",   53.4709, -2.2374),
+    ("University of Salford",          53.4875, -2.2901),
+    ("University of Bolton",           53.5796, -2.4290),
+    ("University of Chester",          53.1901, -2.8939),
+    ("University of Central Lancashire",53.7632, -2.7113),
+    ("Lancaster University",           54.0104, -2.7878),
+    ("Liverpool University",           53.4066, -2.9665),
+    ("Liverpool John Moores Univ",     53.4053, -2.9769),
+    ("Edge Hill University",           53.5501, -2.8797),
+    ("Keele University",               53.0014, -2.2724),
+    ("Staffordshire University",       52.9986, -2.1798),
+    # West Midlands
+    ("Aston University",               52.4862, -1.8876),
+    ("University of Birmingham",       52.4508, -1.9305),
+    ("Birmingham City University",     52.4862, -1.8913),
+    ("University of Warwick",          52.3790, -1.5613),
+    ("Coventry University",            52.4073, -1.5026),
+    ("University of Wolverhampton",    52.5887, -2.1318),
+    # East Midlands
+    ("University of Nottingham",       52.9382, -1.1974),
+    ("Nottingham Trent University",    52.9560, -1.1513),
+    ("University of Leicester",        52.6219, -1.1290),
+    ("De Montfort University",         52.6313, -1.1358),
+    ("Loughborough University",        52.7659, -1.2247),
+    ("University of Derby",            52.9190, -1.4809),
+    ("University of Lincoln",          53.2307, -0.5434),
+    ("University of Northampton",      52.2477, -0.8987),
+    # East of England
+    ("University of Cambridge",        52.2044,  0.1153),
+    ("Anglia Ruskin University",       52.2018,  0.1349),
+    ("University of East Anglia",      52.6216,  1.2394),
+    # South East
+    ("University of Oxford",           51.7548, -1.2544),
+    ("Oxford Brookes University",      51.7539, -1.2278),
+    ("University of Reading",          51.4413, -0.9406),
+    ("University of Surrey",           51.2440, -0.5875),
+    ("University of Sussex",           50.8673, -0.0878),
+    ("University of Brighton",         50.8230, -0.1403),
+    ("University of Kent",             51.2980,  1.0649),
+    ("Canterbury Christ Church Univ",  51.2824,  1.0750),
+    ("University of Portsmouth",       50.7984, -1.0965),
+    ("University of Southampton",      50.9340, -1.3958),
+    ("Brunel University",              51.5327, -0.4769),
+    ("Royal Holloway University",      51.4255, -0.5640),
+    ("University of Hertfordshire",    51.7520, -0.2438),
+    # London
+    ("University College London",      51.5246, -0.1340),
+    ("King's College London",          51.5116, -0.1162),
+    ("Queen Mary Univ of London",      51.5244, -0.0402),
+    ("City University of London",      51.5281, -0.1020),
+    ("London Metropolitan University", 51.5244, -0.0770),
+    ("London South Bank University",   51.5009, -0.1022),
+    ("University of East London",      51.5090,  0.0493),
+    ("University of Greenwich",        51.4825,  0.0036),
+    ("Kingston University",            51.4104, -0.3000),
+    ("University of Westminster",      51.5183, -0.1436),
+    ("University of Roehampton",       51.4644, -0.2261),
+    # South West
+    ("University of Bristol",          51.4584, -2.6032),
+    ("UWE Bristol",                    51.4996, -2.5476),
+    ("University of Bath",             51.3783, -2.3280),
+    ("Bath Spa University",            51.3873, -2.3617),
+    ("University of Exeter",           50.7358, -3.5337),
+    ("University of Plymouth",         50.3755, -4.1432),
+    ("Bournemouth University",         50.7420, -1.8959),
+    ("University of Gloucestershire",  51.8582, -2.2435),
+    # Wales
+    ("Cardiff University",             51.4876, -3.1827),
+    ("Cardiff Metropolitan University",51.4959, -3.2125),
+    ("University of South Wales",      51.5957, -3.3416),
+    ("Swansea University",             51.6214, -3.8877),
+    ("Aberystwyth University",         52.4153, -4.0658),
+    ("Bangor University",              53.2277, -4.1271),
+    # Scotland
+    ("University of Edinburgh",        55.9445, -3.1892),
+    ("Heriot-Watt University",         55.9093, -3.3226),
+    ("Edinburgh Napier University",    55.9260, -3.2188),
+    ("University of Glasgow",          55.8718, -4.2888),
+    ("University of Strathclyde",      55.8613, -4.2445),
+    ("Glasgow Caledonian University",  55.8671, -4.2499),
+    ("University of Aberdeen",         57.1657, -2.1033),
+    ("Robert Gordon University",       57.1407, -2.1264),
+    ("University of Dundee",           56.4577, -2.9796),
+    ("University of St Andrews",       56.3399, -2.9778),
+    ("University of Stirling",         56.1447, -3.9199),
+    # Northern Ireland
+    ("Queen's University Belfast",     54.5845, -5.9344),
+    ("Ulster University",              54.9980, -6.6538),
+]
+
+UK_HOSPITALS = [
+    # Yorkshire
+    ("Leeds General Infirmary",                53.8027, -1.5491),
+    ("St James's University Hospital Leeds",   53.8036, -1.5197),
+    ("Bradford Royal Infirmary",               53.8022, -1.7718),
+    ("Pinderfields Hospital Wakefield",        53.6819, -1.4821),
+    ("Calderdale Royal Hospital Halifax",      53.7108, -1.8574),
+    ("Huddersfield Royal Infirmary",           53.6442, -1.7810),
+    ("York Hospital",                          53.9603, -1.0771),
+    ("Hull Royal Infirmary",                   53.7458, -0.3466),
+    ("Sheffield Teaching Hospitals",           53.3797, -1.4868),
+    ("Rotherham Hospital",                     53.4344, -1.3643),
+    ("Doncaster Royal Infirmary",              53.5256, -1.0960),
+    ("Barnsley Hospital",                      53.5561, -1.4752),
+    # North East
+    ("Newcastle RVI",                          54.9839, -1.6169),
+    ("Freeman Hospital Newcastle",             55.0019, -1.6056),
+    ("James Cook University Hospital",         54.5568, -1.2244),
+    ("Sunderland Royal Hospital",              54.9046, -1.4056),
+    ("University Hospital of North Durham",    54.7788, -1.5701),
+    # North West
+    ("Manchester Royal Infirmary",             53.4622, -2.2261),
+    ("Salford Royal Hospital",                 53.4867, -2.3420),
+    ("Wythenshawe Hospital Manchester",        53.3883, -2.2953),
+    ("Royal Liverpool Hospital",               53.4065, -2.9682),
+    ("Aintree University Hospital",            53.4695, -2.9627),
+    ("Alder Hey Children's Hospital",          53.4204, -2.9219),
+    ("Blackpool Victoria Hospital",            53.8180, -3.0504),
+    ("Royal Preston Hospital",                 53.7607, -2.7040),
+    ("Stoke Royal Hospital",                   53.0006, -2.1804),
+    # West Midlands
+    ("University Hospital Birmingham",         52.4527, -1.9434),
+    ("Birmingham City Hospital",               52.5088, -1.9745),
+    ("Heartlands Hospital Birmingham",         52.4758, -1.8275),
+    ("Walsall Manor Hospital",                 52.5859, -1.9716),
+    ("University Hospital Coventry",           52.3970, -1.4983),
+    ("New Cross Hospital Wolverhampton",       52.5851, -2.1420),
+    # East Midlands
+    ("Nottingham City Hospital",               52.9797, -1.1771),
+    ("Queen's Medical Centre Nottingham",      52.9427, -1.1852),
+    ("University Hospitals of Leicester",      52.6273, -1.1371),
+    ("Derby Royal Hospital",                   52.9153, -1.4765),
+    ("Lincoln County Hospital",                53.2374, -0.5343),
+    # East of England
+    ("Addenbrooke's Hospital Cambridge",       52.1762,  0.1410),
+    ("Norfolk and Norwich Hospital",           52.6218,  1.2390),
+    # South East
+    ("John Radcliffe Hospital Oxford",         51.7625, -1.2203),
+    ("Southampton General Hospital",           50.9339, -1.4244),
+    ("Portsmouth QA Hospital",                 50.8499, -1.0626),
+    ("Royal Sussex County Hospital Brighton",  50.8222, -0.1401),
+    ("East Kent Hospitals",                    51.2770,  1.0894),
+    ("Royal Berkshire Hospital Reading",       51.4517, -0.9740),
+    # London
+    ("University College Hospital London",     51.5254, -0.1356),
+    ("Guy's Hospital London",                  51.5034, -0.0879),
+    ("King's College Hospital London",         51.4681, -0.0938),
+    ("St Thomas' Hospital London",             51.4991, -0.1187),
+    ("St George's Hospital London",            51.4282, -0.1756),
+    ("Royal Free Hospital London",             51.5530, -0.1659),
+    ("Royal London Hospital Whitechapel",      51.5186, -0.0594),
+    ("Charing Cross Hospital",                 51.4893, -0.2196),
+    # South West
+    ("Bristol Royal Infirmary",                51.4583, -2.5983),
+    ("Southmead Hospital Bristol",             51.5017, -2.6043),
+    ("Royal United Hospital Bath",             51.3890, -2.3793),
+    ("Derriford Hospital Plymouth",            50.4189, -4.1201),
+    ("Royal Devon and Exeter Hospital",        50.7299, -3.5264),
+    ("Bournemouth Royal Hospital",             50.7249, -1.8341),
+    # Wales
+    ("University Hospital of Wales Cardiff",   51.4851, -3.1914),
+    ("Morriston Hospital Swansea",             51.6570, -3.9307),
+    # Scotland
+    ("Royal Infirmary of Edinburgh",           55.9201, -3.1357),
+    ("Western General Hospital Edinburgh",     55.9601, -3.2205),
+    ("Glasgow Royal Infirmary",                55.8638, -4.2391),
+    ("Queen Elizabeth Univ Hospital Glasgow",  55.8584, -4.3162),
+    ("Aberdeen Royal Infirmary",               57.1571, -2.1270),
+    ("Ninewells Hospital Dundee",              56.4637, -3.0076),
+    # Northern Ireland
+    ("Belfast City Hospital",                  54.5882, -5.9464),
+    ("Royal Victoria Hospital Belfast",        54.5972, -5.9678),
+]
+
+UK_STATIONS = [
+    # Yorkshire
+    ("Leeds",                   53.7956, -1.5487),
+    ("Sheffield",               53.3779, -1.4634),
+    ("York",                    53.9581, -1.0929),
+    ("Hull",                    53.7440, -0.3462),
+    ("Bradford Interchange",    53.7921, -1.7518),
+    ("Huddersfield",            53.6476, -1.7849),
+    ("Halifax",                 53.7225, -1.8608),
+    ("Wakefield Westgate",      53.6806, -1.5015),
+    ("Doncaster",               53.5219, -1.1341),
+    ("Barnsley",                53.5576, -1.4786),
+    ("Rotherham Central",       53.4349, -1.3628),
+    # North East
+    ("Newcastle",               54.9683, -1.6175),
+    ("Sunderland",              54.9058, -1.3791),
+    ("Durham",                  54.7774, -1.5730),
+    ("Darlington",              54.5235, -1.5533),
+    ("Middlesbrough",           54.5773, -1.2349),
+    # North West
+    ("Manchester Piccadilly",   53.4773, -2.2310),
+    ("Manchester Victoria",     53.4841, -2.2416),
+    ("Liverpool Lime Street",   53.4069, -2.9777),
+    ("Preston",                 53.7574, -2.7066),
+    ("Blackpool North",         53.8218, -3.0524),
+    ("Wigan North Western",     53.5460, -2.6347),
+    ("Bolton",                  53.5776, -2.4296),
+    ("Lancaster",               54.0474, -2.8068),
+    ("Carlisle",                54.8888, -2.9331),
+    ("Crewe",                   53.0885, -2.4346),
+    ("Chester",                 53.1896, -2.8802),
+    ("Stoke-on-Trent",          53.0047, -2.1758),
+    # Midlands
+    ("Birmingham New Street",   52.4776, -1.9004),
+    ("Wolverhampton",           52.5897, -2.1241),
+    ("Coventry",                52.4013, -1.5110),
+    ("Nottingham",              52.9479, -1.1454),
+    ("Leicester",               52.6333, -1.1257),
+    ("Derby",                   52.9145, -1.4762),
+    ("Lincoln",                 53.2270, -0.5422),
+    ("Shrewsbury",              52.7113, -2.7547),
+    # East
+    ("Cambridge",               52.1940,  0.1373),
+    ("Norwich",                 52.6274,  1.3079),
+    ("Peterborough",            52.5765, -0.2509),
+    # London
+    ("London Euston",           51.5281, -0.1338),
+    ("London King's Cross",     51.5307, -0.1228),
+    ("London Paddington",       51.5154, -0.1755),
+    ("London Liverpool St",     51.5178, -0.0823),
+    ("London Waterloo",         51.5031, -0.1132),
+    ("London Victoria",         51.4952, -0.1439),
+    ("London Bridge",           51.5054, -0.0864),
+    # South East
+    ("Reading",                 51.4587, -0.9718),
+    ("Oxford",                  51.7534, -1.2690),
+    ("Southampton Central",     50.9094, -1.4142),
+    ("Portsmouth Harbour",      50.7990, -1.1071),
+    ("Brighton",                50.8290, -0.1414),
+    ("Gatwick Airport",         51.1565, -0.1619),
+    # South West
+    ("Bristol Temple Meads",    51.4491, -2.5813),
+    ("Bath Spa",                51.3786, -2.3600),
+    ("Exeter St Davids",        50.7270, -3.5347),
+    ("Plymouth",                50.3780, -4.1430),
+    ("Bournemouth",             50.7259, -1.8758),
+    # Wales
+    ("Cardiff Central",         51.4762, -3.1792),
+    ("Swansea",                 51.6213, -3.9436),
+    # Scotland
+    ("Edinburgh Waverley",      55.9518, -3.1903),
+    ("Glasgow Central",         55.8584, -4.2573),
+    ("Aberdeen",                57.1439, -2.0975),
+    ("Dundee",                  56.4572, -2.9699),
+    ("Inverness",               57.4772, -4.2276),
+    # Northern Ireland
+    ("Belfast Central",         54.5974, -5.9169),
+]
+
+# Estimated monthly room rent (£) by outcode alpha-prefix
+OUTCODE_ROOM_RENTS: dict[str, int] = {
+    # London inner
+    "E": 950, "EC": 1050, "N": 900, "NW": 900,
+    "SE": 900, "SW": 950, "W": 1000, "WC": 1050,
+    # London outer
+    "BR": 750, "CR": 700, "DA": 700, "EN": 700,
+    "HA": 700, "IG": 700, "KT": 750, "RM": 700,
+    "SM": 700, "TW": 750, "UB": 700, "WD": 720,
+    # South East
+    "AL": 650, "BN": 600, "CT": 550, "GU": 650,
+    "HP": 650, "LU": 600, "ME": 550, "MK": 580,
+    "OX": 700, "PO": 600, "RG": 650, "RH": 620,
+    "SG": 640, "SL": 700, "SN": 560, "SO": 600,
+    "SS": 600, "TN": 580,
+    # South West
+    "BA": 580, "BH": 580, "BS": 600, "DT": 500,
+    "EX": 520, "GL": 560, "PL": 490, "TA": 480,
+    "TQ": 510, "TR": 490,
+    # East
+    "CB": 680, "CM": 600, "CO": 550, "IP": 520,
+    "NR": 500, "PE": 500,
+    # East Midlands
+    "CV": 500, "DE": 480, "LE": 500, "LN": 460,
+    "NG": 500, "NN": 480,
+    # West Midlands
+    "B": 520, "DY": 480, "ST": 460, "TF": 450,
+    "WR": 470, "WS": 480, "WV": 480,
+    # Yorkshire & Humber
+    "BD": 430, "DN": 430, "HD": 420, "HG": 450,
+    "HU": 430, "HX": 420, "LS": 520, "S": 460,
+    "WF": 430, "YO": 460,
+    # North West
+    "BB": 420, "BL": 430, "CA": 430, "CH": 450,
+    "CW": 450, "FY": 420, "L": 480, "LA": 440,
+    "M": 600, "OL": 430, "PR": 430, "SK": 480,
+    "WA": 450, "WN": 430,
+    # North East
+    "DH": 380, "DL": 380, "NE": 400, "SR": 380, "TS": 390,
+    # Wales
+    "CF": 460, "LD": 400, "LL": 420, "NP": 440,
+    "SA": 430, "SY": 420,
+    # Scotland
+    "AB": 490, "DD": 460, "DG": 400, "EH": 600,
+    "FK": 450, "G": 520, "IV": 420, "KA": 420,
+    "KY": 450, "ML": 420, "PA": 430, "PH": 440, "TD": 400,
+    # Northern Ireland
+    "BT": 420,
+}
+
+# ── Scoring breakpoints ───────────────────────────────────────────────────────
+# Each list is (threshold, score); first threshold that the value is ≤ (for
+# distance / price) or ≥ (for yield / density) wins; fallback is 0.
+
+_UNI_BP    = [(1, 10), (2, 9), (3, 8), (5, 6), (8, 4), (12, 2)]   # km
+_HOSP_BP   = [(1, 10), (2, 8), (3, 6), (5, 4), (8, 2)]             # km
+_STA_BP    = [(0.5, 10), (1, 9), (2, 7), (3, 5), (5, 3), (8, 1)]  # km
+_YIELD_BP  = [(15, 10), (12, 8), (10, 6), (8, 4), (6, 2)]          # % gross yield
+_DENS_BP   = [(20, 10), (15, 8), (10, 6), (5, 4), (2, 2)]          # % already-HMO
+_AFFORD_BP = [                                                       # £ median
+    (100_000, 10), (130_000, 9), (150_000, 8), (170_000, 7),
+    (190_000, 6),  (210_000, 5), (220_000, 4), (250_000, 3), (300_000, 1),
+]
+
+_SCORE_WEIGHTS = {
+    "university":    0.30,
+    "yield":         0.25,
+    "hmo_density":   0.20,
+    "transport":     0.15,
+    "hospital":      0.07,
+    "affordability": 0.03,
+}
+
 # URL collection concurrency
 URL_CONCURRENCY = 20
 
@@ -83,6 +445,45 @@ TAG_RE     = re.compile(r"<[^>]+>")
 # ============================================================
 # HELPERS
 # ============================================================
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def _nearest_km(lat: float, lon: float, pois: list) -> float:
+    """Minimum haversine distance in km from (lat, lon) to any POI in list."""
+    return min(haversine_km(lat, lon, p[1], p[2]) for p in pois)
+
+
+def _score_lower_better(value: float, breakpoints: list) -> int:
+    """Return score where a lower value is better (distances, prices)."""
+    for threshold, score in breakpoints:
+        if value <= threshold:
+            return score
+    return 0
+
+
+def _score_higher_better(value: float, breakpoints: list) -> int:
+    """Return score where a higher value is better (yield, density)."""
+    for threshold, score in sorted(breakpoints, reverse=True):
+        if value >= threshold:
+            return score
+    return 0
+
+
+def _get_room_rent(outcode: str) -> int:
+    """Look up estimated monthly room rent (£) for an outcode."""
+    prefix = re.match(r"^([A-Z]+)", (outcode or "").upper())
+    if not prefix:
+        return 420
+    key = prefix.group(1)
+    # Try 2-letter prefix first (e.g. "NW"), then 1-letter fallback
+    return OUTCODE_ROOM_RENTS.get(key, OUTCODE_ROOM_RENTS.get(key[:1], 420))
+
 
 def html_to_text(s: str) -> str:
     if not s:
@@ -693,6 +1094,322 @@ def push_to_github(parquet_path: Path):
 
 
 # ============================================================
+# HMO ANALYSIS & EMAIL
+# ============================================================
+
+def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
+    """
+    Identify HMO conversion candidates and score outcode hotspots.
+
+    Candidate criteria:
+      - 3+ bedrooms, house type (not flat), not already marketed as HMO
+
+    Hotspot composite score (0–10, weighted sum of six signals):
+      university proximity  30%  — tenant demand from students
+      estimated gross yield 25%  — (room_rent × beds × 12) / price
+      HMO market density    20%  — % of houses in outcode already listed as HMO
+                                   (proves demand without implying saturation)
+      transport proximity   15%  — distance to nearest major rail/metro station
+      hospital proximity     7%  — demand from NHS staff / key workers
+      affordability          3%  — median price vs £220 k cap
+    """
+    df = df.copy()
+    df["price_num"] = pd.to_numeric(df["price"], errors="coerce")
+    df["beds_num"]  = pd.to_numeric(df["bedrooms"], errors="coerce")
+    df["is_house"]  = (
+        df["property_type"].fillna("")
+        .str.contains(_HOUSE_TYPE_PAT, case=False, regex=True)
+    )
+    df["outcode"] = df["postcode"].fillna("").str.split().str[0].str.upper()
+
+    hmo_candidates = df[
+        (df["beds_num"] >= 3) &
+        df["is_house"] &
+        (~df["potential_hmo"].fillna(False))
+    ].copy()
+
+    five_plus = df[df["beds_num"] >= 5].copy()
+
+    # ── Per-outcode stats ─────────────────────────────────────────────────────
+    all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
+
+    # Centroid: average lat/lon of all scraped properties per outcode
+    centroids = (
+        all_houses.dropna(subset=["latitude", "longitude"])
+        .groupby("outcode")
+        .agg(lat=("latitude", "mean"), lon=("longitude", "mean"))
+    )
+
+    # HMO density: already-HMO houses as % of all houses in outcode
+    hmo_counts   = all_houses[all_houses["potential_hmo"].fillna(False)].groupby("outcode").size()
+    house_counts = all_houses.groupby("outcode").size()
+    hmo_density  = (hmo_counts / house_counts * 100).fillna(0).rename("hmo_density_pct")
+
+    valid_cands = hmo_candidates[
+        hmo_candidates["outcode"].notna() & (hmo_candidates["outcode"] != "")
+    ]
+    agg = (
+        valid_cands.groupby("outcode")
+        .agg(
+            opportunities=("url",       "count"),
+            median_price =("price_num", "median"),
+            avg_beds     =("beds_num",  "mean"),
+            under_220k   =("price_num", lambda x: (x < HMO_PRICE_THRESHOLD).sum()),
+        )
+    )
+
+    # ── Scoring ───────────────────────────────────────────────────────────────
+    rows = []
+    for oc, row in agg.iterrows():
+        if oc not in centroids.index:
+            continue
+        lat, lon = centroids.loc[oc, "lat"], centroids.loc[oc, "lon"]
+        med_price = row["median_price"]
+        avg_beds  = row["avg_beds"]
+        room_rent = _get_room_rent(oc)
+        density   = hmo_density.get(oc, 0.0)
+
+        # Gross yield estimate: (annual room income) / purchase price × 100
+        est_yield = (
+            (room_rent * avg_beds * 12) / med_price * 100
+            if pd.notna(med_price) and med_price > 0 else 0.0
+        )
+
+        dist_uni  = _nearest_km(lat, lon, UK_UNIVERSITIES)
+        dist_hosp = _nearest_km(lat, lon, UK_HOSPITALS)
+        dist_sta  = _nearest_km(lat, lon, UK_STATIONS)
+
+        s_uni    = _score_lower_better(dist_uni,   _UNI_BP)
+        s_hosp   = _score_lower_better(dist_hosp,  _HOSP_BP)
+        s_sta    = _score_lower_better(dist_sta,   _STA_BP)
+        s_yield  = _score_higher_better(est_yield, _YIELD_BP)
+        s_dens   = _score_higher_better(density,   _DENS_BP)
+        s_afford = _score_lower_better(med_price or 999_999, _AFFORD_BP)
+
+        composite = (
+            s_uni    * _SCORE_WEIGHTS["university"]
+            + s_yield  * _SCORE_WEIGHTS["yield"]
+            + s_dens   * _SCORE_WEIGHTS["hmo_density"]
+            + s_sta    * _SCORE_WEIGHTS["transport"]
+            + s_hosp   * _SCORE_WEIGHTS["hospital"]
+            + s_afford * _SCORE_WEIGHTS["affordability"]
+        )
+
+        rows.append({
+            "outcode":       oc,
+            "opportunities": int(row["opportunities"]),
+            "median_price":  med_price,
+            "avg_beds":      avg_beds,
+            "under_220k":    int(row["under_220k"]),
+            "hmo_density":   round(density, 1),
+            "est_yield":     round(est_yield, 1),
+            "dist_uni_km":   round(dist_uni, 1),
+            "dist_hosp_km":  round(dist_hosp, 1),
+            "dist_sta_km":   round(dist_sta, 1),
+            "score_uni":     s_uni,
+            "score_hosp":    s_hosp,
+            "score_transport": s_sta,
+            "score_yield":   s_yield,
+            "score_density": s_dens,
+            "score_afford":  s_afford,
+            "composite_score": round(composite, 2),
+        })
+
+    hotspots = (
+        pd.DataFrame(rows)
+        .sort_values("composite_score", ascending=False)
+        .head(20)
+        .reset_index(drop=True)
+    )
+
+    # Attach outcode score to affordable candidates for email
+    score_map = hotspots.set_index("outcode")["composite_score"].to_dict()
+    affordable = hmo_candidates[
+        hmo_candidates["price_num"] < HMO_PRICE_THRESHOLD
+    ].copy()
+    affordable["hmo_score"] = affordable["outcode"].map(score_map)
+    affordable = affordable.sort_values(
+        ["hmo_score", "price_num"], ascending=[False, True]
+    )
+
+    return {
+        "total":          len(df),
+        "hmo_candidates": hmo_candidates,
+        "five_plus":      five_plus,
+        "affordable":     affordable,
+        "hotspots":       hotspots,
+    }
+
+
+def print_metrics_report(analysis: dict) -> None:
+    cands     = analysis["hmo_candidates"]
+    five_plus = analysis["five_plus"]
+    aff       = analysis["affordable"]
+    hot       = analysis["hotspots"]
+
+    p = cands["price_num"]
+    band_mid  = ((p >= HMO_PRICE_THRESHOLD) & (p < 350_000)).sum()
+    band_high = (p >= 350_000).sum()
+
+    print("\n" + "=" * 64)
+    print("  HMO OPPORTUNITY ANALYSIS")
+    print("=" * 64)
+    print(f"  Total properties scraped      : {analysis['total']:>8,}")
+    print(f"  HMO conversion candidates     : {len(cands):>8,}  (3+ bed house, non-HMO)")
+    print(f"    Under £{HMO_PRICE_THRESHOLD:,}               : {len(aff):>8,}")
+    print(f"    £{HMO_PRICE_THRESHOLD:,} – £350,000          : {band_mid:>8,}")
+    print(f"    Over £350,000                : {band_high:>8,}")
+    print(f"  5+ bed properties (all types) : {len(five_plus):>8,}")
+    if len(cands) > 0 and p.notna().any():
+        print(f"\n  Price stats (HMO candidates):")
+        print(f"    Median  : £{p.median():>10,.0f}")
+        print(f"    Mean    : £{p.mean():>10,.0f}")
+        print(f"    Min     : £{p.min():>10,.0f}")
+        print(f"    Max     : £{p.max():>10,.0f}")
+
+    if len(hot) > 0:
+        print(f"\n  TOP HMO HOTSPOTS  (ranked by composite investment score)")
+        hdr = (
+            f"  {'#':<3}  {'Area':<7}  {'Score':>5}  {'Count':>5}  "
+            f"{'Median':>9}  {'Yield':>5}  {'HMO%':>4}  "
+            f"{'Uni km':>6}  {'Sta km':>6}  {'<220k':>5}"
+        )
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        for _, row in hot.iterrows():
+            med = f"£{row['median_price']:,.0f}" if pd.notna(row["median_price"]) else "N/A"
+            print(
+                f"  {_+1:<3}  {row['outcode']:<7}  {row['composite_score']:>5.2f}"
+                f"  {row['opportunities']:>5,}  {med:>9}"
+                f"  {row['est_yield']:>4.1f}%  {row['hmo_density']:>4.1f}%"
+                f"  {row['dist_uni_km']:>6.1f}  {row['dist_sta_km']:>6.1f}"
+                f"  {row['under_220k']:>5,}"
+            )
+    print("=" * 64 + "\n")
+
+
+def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
+    date_str = time.strftime("%d %B %Y")
+
+    hotspot_rows = ""
+    for i, row in hotspots.iterrows():
+        med    = f"£{row['median_price']:,.0f}" if pd.notna(row["median_price"]) else "—"
+        score  = row["composite_score"]
+        # Colour-code score: green ≥7, amber ≥4, red <4
+        sc     = int(score * 10)
+        colour = "#27ae60" if score >= 7 else ("#e67e22" if score >= 4 else "#c0392b")
+        hotspot_rows += (
+            f"<tr>"
+            f"<td>{i+1}</td>"
+            f"<td><b>{row['outcode']}</b></td>"
+            f"<td style='color:{colour};font-weight:bold'>{score:.2f}</td>"
+            f"<td>{int(row['opportunities']):,}</td>"
+            f"<td>{med}</td>"
+            f"<td>{row['est_yield']:.1f}%</td>"
+            f"<td>{row['hmo_density']:.1f}%</td>"
+            f"<td>{row['dist_uni_km']:.1f} km</td>"
+            f"<td>{row['dist_sta_km']:.1f} km</td>"
+            f"<td>{int(row['under_220k']):,}</td>"
+            f"</tr>\n"
+        )
+
+    property_rows = ""
+    for _, r in affordable.head(100).iterrows():
+        price  = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "—"
+        beds   = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
+        addr   = r.get("address") or "View listing"
+        ptype  = r.get("property_type") or "—"
+        pc     = r.get("postcode") or "—"
+        score  = r.get("hmo_score")
+        score_str = f"{score:.1f}" if pd.notna(score) else "—"
+        auction_flag = " &#9873;" if r.get("potential_auction") else ""
+        property_rows += (
+            f"<tr>"
+            f"<td><a href='{r['url']}'>{addr}{auction_flag}</a></td>"
+            f"<td>{pc}</td><td>{price}</td><td>{beds}</td><td>{ptype}</td>"
+            f"<td style='text-align:center'>{score_str}</td>"
+            f"</tr>\n"
+        )
+
+    return f"""<html><body style="font-family:Arial,sans-serif;color:#222;max-width:960px;margin:auto;">
+<h2 style="color:#c0392b;border-bottom:2px solid #c0392b;padding-bottom:6px;">
+  HMO Opportunity Report &mdash; {date_str}
+</h2>
+<p>HMO conversion candidates (3+ bed house, not already HMO) priced under
+<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties are sorted by area investment score, then price.</p>
+<p><b>{len(affordable):,} properties</b> meet the criteria.</p>
+
+<h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>
+<p style="font-size:0.85em;color:#555;">
+  Composite score (0–10) weights: university proximity 30% · estimated gross yield 25% ·
+  HMO market density 20% · transport 15% · hospital proximity 7% · affordability 3%.<br>
+  HMO density = % of houses in that outcode already listed as HMO — signals proven tenant demand.
+</p>
+<table border="1" cellpadding="7" cellspacing="0"
+       style="border-collapse:collapse;width:100%;font-size:0.88em;">
+  <tr style="background:#2c3e50;color:#fff;">
+    <th>#</th><th>Area</th><th>Score</th><th>Listings</th>
+    <th>Median Price</th><th>Est. Yield</th><th>HMO Density</th>
+    <th>Uni Dist</th><th>Station Dist</th><th>Under £220k</th>
+  </tr>
+  {hotspot_rows}
+</table>
+
+<h3 style="margin-top:2em;">Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}</h3>
+<p style="font-size:0.85em;color:#555;">
+  Showing top 100 of {len(affordable):,} total candidates, ranked by area score then price.
+  &#9873; = auction listing &nbsp;|&nbsp; Score = outcode composite score
+</p>
+<table border="1" cellpadding="7" cellspacing="0"
+       style="border-collapse:collapse;width:100%;font-size:0.88em;">
+  <tr style="background:#c0392b;color:#fff;">
+    <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th><th>Score</th>
+  </tr>
+  {property_rows}
+</table>
+
+<p style="color:#999;margin-top:2em;font-size:0.8em;">
+  Generated by Rightmove HMO Scraper &mdash; {time.strftime('%Y-%m-%d %H:%M')} UTC<br>
+  Yield is estimated gross (room rent × beds × 12 ÷ price). Room rents are regional averages.
+</p>
+</body></html>"""
+
+
+def send_hmo_email(analysis: dict) -> None:
+    """Send HMO opportunity email via Gmail SMTP (needs GMAIL_USER + GMAIL_APP_PASSWORD env vars)."""
+    gmail_user = os.environ.get("GMAIL_USER", "").strip()
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+
+    if not gmail_user or not gmail_pass or not HMO_EMAIL_TO:
+        print("GMAIL_USER / GMAIL_APP_PASSWORD / HMO_EMAIL_TO not set — skipping HMO email.")
+        return
+
+    affordable = analysis["affordable"]
+    if affordable.empty:
+        print("No properties under £{:,} found — skipping email.".format(HMO_PRICE_THRESHOLD))
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = (
+        f"HMO Opportunities Under £{HMO_PRICE_THRESHOLD:,} "
+        f"({len(affordable):,} properties) — {time.strftime('%d %b %Y')}"
+    )
+    msg["From"] = gmail_user
+    msg["To"]   = HMO_EMAIL_TO
+
+    html = _build_email_html(affordable, analysis["hotspots"])
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_user, gmail_pass)
+            smtp.sendmail(gmail_user, HMO_EMAIL_TO, msg.as_string())
+        print(f"HMO email sent to {HMO_EMAIL_TO} — {len(affordable):,} properties listed.")
+    except Exception as exc:
+        print(f"Email send failed: {exc}")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -764,6 +1481,13 @@ async def run():
     output = final_parquet_name()
     consolidate_shards(shard_dir, output)
 
+    # ---- HMO ANALYSIS & EMAIL ----
+    if output.exists():
+        df_all   = pd.read_parquet(output)
+        analysis = analyse_hmo_opportunities(df_all)
+        print_metrics_report(analysis)
+        send_hmo_email(analysis)
+
     # Only clean state + push if every URL was scraped (no pending left)
     still_pending = len(state["collected_urls"] - state["seen_urls"])
     if still_pending == 0:
@@ -781,6 +1505,20 @@ async def run():
     print(f"Output : {output}")
     print(f"Seen   : {len(state['seen_urls']):,}")
     print(f"Pending: {still_pending:,}")
+
+
+def run_analyse_only():
+    """Re-run HMO analysis on the most recent parquet without re-scraping."""
+    parquets = sorted(DATA_DIR.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not parquets:
+        print("No parquet files found in data/ — run the scraper first.")
+        return
+    output = parquets[0]
+    print(f"Analysing {output.name} …")
+    df_all   = pd.read_parquet(output)
+    analysis = analyse_hmo_opportunities(df_all)
+    print_metrics_report(analysis)
+    send_hmo_email(analysis)
 
 
 async def run_retry_failed():
@@ -812,7 +1550,9 @@ async def run_retry_failed():
 
 if __name__ == "__main__":
     freeze_support()
-    if RETRY_FAILED:
+    if ANALYSE_ONLY:
+        run_analyse_only()
+    elif RETRY_FAILED:
         asyncio.run(run_retry_failed())
     else:
         asyncio.run(run())

@@ -37,6 +37,9 @@ jobs:
       - name: Run scraper
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
         run: |
           ARGS="--time-limit 130"
           if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
