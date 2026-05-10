@@ -3,16 +3,24 @@ name: Rightmove Scraper
 on:
   workflow_dispatch:
     inputs:
+      rightmove_only:
+        description: "Rightmove scrape only (no SpareRoom, no analysis)"
+        type: boolean
+        default: false
+      spareroom_only:
+        description: "SpareRoom scrape only (no Rightmove, no analysis)"
+        type: boolean
+        default: false
       analyse_only:
-        description: "Analyse existing parquet and send HMO email (no scraping)"
+        description: "Analysis and email only (no scraping)"
         type: boolean
         default: false
       retry_failed:
-        description: "Retry previously failed URLs"
+        description: "Retry previously failed Rightmove URLs"
         type: boolean
         default: false
       rebuild_from_all:
-        description: "Rebuild parquet from all collected URLs"
+        description: "Rebuild Rightmove parquet from all collected URLs"
         type: boolean
         default: false
   schedule:
@@ -38,8 +46,8 @@ jobs:
       - name: Install Python dependencies
         run: pip install aiohttp pandas pyarrow beautifulsoup4 shapely
 
-      - name: Run scraper
-        if: ${{ inputs.analyse_only != true }}
+      - name: Run Rightmove scrape
+        if: ${{ inputs.spareroom_only != true && inputs.analyse_only != true }}
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
         run: |
@@ -48,8 +56,8 @@ jobs:
           if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
           python scraper_alternative.py $ARGS
 
-      - name: Push parquet to repo
-        if: ${{ inputs.analyse_only != true }}
+      - name: Push Rightmove parquet to repo
+        if: ${{ inputs.spareroom_only != true && inputs.analyse_only != true }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -59,12 +67,13 @@ jobs:
           git push
 
       - name: Run SpareRoom scrape
+        if: ${{ inputs.rightmove_only != true && inputs.analyse_only != true }}
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
         run: python scraper_alternative.py --spareroom-only
 
       - name: Push SpareRoom data to repo
-        if: always()
+        if: ${{ always() && inputs.rightmove_only != true && inputs.analyse_only != true }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -75,6 +84,7 @@ jobs:
           git push
 
       - name: Run analysis and send email
+        if: ${{ inputs.rightmove_only != true && inputs.spareroom_only != true }}
         env:
           OUTCODE_CSV: ${{ github.workspace }}/outercode_to_postcode_master.csv
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
