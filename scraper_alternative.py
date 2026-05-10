@@ -1921,6 +1921,10 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable["pot_rooms"]     = _hmo_est.apply(lambda x: x[0])
     affordable["ensuite_rooms"] = _hmo_est.apply(lambda x: x[1])
     affordable["est_monthly"]   = affordable["room_rent_est"] * affordable["pot_rooms"]
+    affordable["est_yield_pct"] = (
+        affordable["est_monthly"] * 12 / affordable["price_num"] * 100
+    ).where(affordable["price_num"] > 0)
+    affordable = affordable.sort_values("est_yield_pct", ascending=False)
 
     return {
         "total":          len(df),
@@ -2031,10 +2035,9 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
         ens_str     = str(int(ens)) if pd.notna(ens) else "-"
         monthly     = r.get("est_monthly")
         monthly_str = f"£{int(monthly):,}" if pd.notna(monthly) else "-"
-        price_n     = r.get("price_num")
-        gross_yield = (monthly * 12 / price_n * 100) if (pd.notna(monthly) and pd.notna(price_n) and price_n > 0) else None
-        yield_str   = f"{gross_yield:.1f}%" if gross_yield is not None else "-"
-        yield_col   = "#27ae60" if gross_yield and gross_yield >= 10 else ("#e67e22" if gross_yield and gross_yield >= 7 else "#c0392b")
+        gross_yield = r.get("est_yield_pct")
+        yield_str   = f"{gross_yield:.1f}%" if pd.notna(gross_yield) else "-"
+        yield_col   = "#27ae60" if pd.notna(gross_yield) and gross_yield >= 10 else ("#e67e22" if pd.notna(gross_yield) and gross_yield >= 7 else "#c0392b")
         property_rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}{flag}</a></td>"
@@ -2076,7 +2079,7 @@ have been excluded from this report.</p>
 
 <h3 style="margin-top:2em;">Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}</h3>
 <p style="font-size:0.85em;color:#555;">
-  Showing top 100 of {len(affordable):,} total, ranked by area score then price.
+  Showing top 100 of {len(affordable):,} total, ranked by estimated gross yield.
   &#9873; = auction listing &nbsp;|&nbsp; Score = outcode composite score<br>
   <b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms (current beds + convertible receptions).
   <b>En-suite</b> = rooms estimated large enough to add a wet room.
