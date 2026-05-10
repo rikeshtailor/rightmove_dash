@@ -62,7 +62,7 @@ _workers_arg   = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--
 DETAIL_WORKERS = int(_workers_arg) if _workers_arg else min(os.cpu_count() or 4, 8)
 
 _sr_conc_arg   = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--spareroom-concurrency"), None)
-SR_CONCURRENCY = int(_sr_conc_arg) if _sr_conc_arg else 8
+SR_CONCURRENCY = int(_sr_conc_arg) if _sr_conc_arg else 30
 
 _sr_csv_arg  = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--spareroom-csv"), None)
 
@@ -1218,13 +1218,7 @@ def flush_shard(rows, shard_dir, shard_index):
 # ============================================================
 
 SR_BASE_URL   = "https://www.spareroom.co.uk/flatshare/search.pl"
-SR_DETAIL_URL = "https://www.spareroom.co.uk/flatshare/flatshare_detail.pl"
 SR_PAGE_SIZE  = 200
-
-_SR_LOCATION_RE = re.compile(
-    r"location\s*:\s*\{[^}]*?latitude\s*:\s*\"(?P<lat>[-0-9.]+)\"\s*,\s*longitude\s*:\s*\"(?P<lng>[-0-9.]+)\"",
-    re.IGNORECASE | re.DOTALL,
-)
 
 _SR_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -1239,12 +1233,6 @@ def _sr_extract_flatshare_id(url: str) -> str | None:
     qs = parse_qs(urlparse(url).query)
     return qs.get("flatshare_id", [None])[0]
 
-
-def _sr_extract_lat_lng(html: str) -> tuple[float | None, float | None]:
-    m = _SR_LOCATION_RE.search(html or "")
-    if not m:
-        return None, None
-    return _safe_float(m.group("lat")), _safe_float(m.group("lng"))
 
 
 def _sr_load_state(state_file: Path) -> dict:
@@ -1275,47 +1263,6 @@ def _sr_load_postcodes(csv_path: str) -> list[str]:
     col = "Postcode" if "Postcode" in df.columns else df.columns[0]
     return df[col].dropna().astype(str).str.strip().str.upper().unique().tolist()
 
-
-async def _sr_fetch_detail_coords(
-    session: aiohttp.ClientSession,
-    flatshare_id: str,
-    flatshare_type: str,
-) -> tuple[float | None, float | None]:
-    params = {"flatshare_id": flatshare_id, "flatshare_type": flatshare_type, "mode": "details"}
-    for attempt in range(2):
-        headers = dict(_SR_HEADERS)
-        headers["User-Agent"] = random.choice(USER_AGENTS)
-        try:
-            async with session.get(SR_DETAIL_URL, params=params, headers=headers) as r:
-                if r.status != 200:
-                    await asyncio.sleep(0.2 * (attempt + 1))
-                    continue
-                return _sr_extract_lat_lng(await r.text())
-        except Exception:
-            await asyncio.sleep(0.2 * (attempt + 1))
-    return None, None
-
-
-async def _sr_enrich_coords(
-    session: aiohttp.ClientSession,
-    rows: list[dict],
-    flatshare_type: str,
-    max_concurrent: int = 12,
-):
-    sem = asyncio.Semaphore(max_concurrent)
-
-    async def _one(row: dict):
-        fid = row.get("flatshare_id")
-        if not fid:
-            row["latitude"] = row["longitude"] = None
-            return
-        async with sem:
-            lat, lng = await _sr_fetch_detail_coords(session, str(fid), flatshare_type)
-            row["latitude"]  = lat
-            row["longitude"] = lng
-            await asyncio.sleep(random.uniform(0.05, 0.12))
-
-    await asyncio.gather(*(_one(r) for r in rows))
 
 
 class _SpareRoomScraper:
@@ -1377,8 +1324,6 @@ class _SpareRoomScraper:
                 "location":     location.get_text(strip=True) if location else None,
                 "room_type":    room_type.get_text(strip=True) if room_type else None,
                 "available":    avail.get_text(strip=True) if avail else None,
-                "latitude":     None,
-                "longitude":    None,
             }
         except Exception:
             return None
@@ -1422,8 +1367,8 @@ class _SpareRoomScraper:
                 break
 
             offset += SR_PAGE_SIZE
-            if page % 2 == 0:
-                await asyncio.sleep(random.uniform(0.08, 0.18))
+            if page % 5 == 0:
+                await asyncio.sleep(random.uniform(0.05, 0.10))
 
         return rows, last_status
 
@@ -1440,8 +1385,6 @@ def _sr_normalize(row: dict) -> dict:
         "location":     str(row.get("location") or ""),
         "room_type":    str(row.get("room_type") or ""),
         "available":    str(row.get("available") or ""),
-        "latitude":     row.get("latitude"),
-        "longitude":    row.get("longitude"),
         "scraped_at":   pd.Timestamp.utcnow(),
     }
 
@@ -1517,8 +1460,6 @@ async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
             async with sem:
                 scraper = _SpareRoomScraper(pc, session, flatshare_type)
                 rows, status = await scraper.scrape_all()
-
-                await _sr_enrich_coords(session, rows, flatshare_type)
 
                 for r in rows:
                     fid = r.get("flatshare_id")
@@ -2303,7 +2244,8 @@ async def run():
 def run_analyse_only():
     """SpareRoom scrape + HMO analysis on the most recent Rightmove parquet."""
     asyncio.run(run_spareroom("offered", retry_failed=RETRY_FAILED))
-    asyncio.run(run_spareroom("wanted",  retry_failed=RETRY_FAILED))
+    if not IS_CI:
+        asyncio.run(run_spareroom("wanted", retry_failed=RETRY_FAILED))
 
     parquets = sorted(
         DATA_DIR.glob("rightmove_*.parquet"),
