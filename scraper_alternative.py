@@ -1,10 +1,12 @@
 # ============================================================
 # scraper_alternative.py
-# BROWSERLESS RIGHTMOVE SCRAPER (aiohttp only, no Playwright)
+# UNIFIED RIGHTMOVE + SPAREROOM SCRAPER
 #
-# URL collection uses Rightmove's internal search API instead
-# of a real browser, eliminating the Playwright dependency.
-# Detail scraping is unchanged from scraper_optimized_v4.py.
+# Rightmove: browserless search-API URL collection + async detail scraping
+# SpareRoom: async offered/wanted room listing scraper
+# HMO Analysis: composite hotspot scoring + email report
+#
+# All data is written under data/
 # ============================================================
 
 import os
@@ -21,54 +23,94 @@ import threading
 from threading import Thread
 from multiprocessing import Process, Queue, freeze_support
 from pathlib import Path
+from math import radians, sin, cos, sqrt, atan2
+from urllib.parse import urlparse, parse_qs
 import pyarrow as pa
 import pyarrow.parquet as pq
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from math import radians, sin, cos, sqrt, atan2
+
+try:
+    from bs4 import BeautifulSoup
+    _BS4_AVAILABLE = True
+except ImportError:
+    _BS4_AVAILABLE = False
+
+# ============================================================
+# CLI FLAGS
+# ============================================================
 
 RETRY_FAILED     = "--retry-failed"     in sys.argv
 REBUILD_FROM_ALL = "--rebuild-from-all" in sys.argv
 ANALYSE_ONLY     = "--analyse-only"     in sys.argv
+RIGHTMOVE_ONLY   = "--rightmove-only"   in sys.argv
+SPAREROOM_ONLY   = "--spareroom-only"   in sys.argv
 
-# --time-limit N: exit cleanly after N minutes (for chunked CI runs)
 _time_limit_arg = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--time-limit"), None)
 TIME_LIMIT_SECS = int(_time_limit_arg) * 60 if _time_limit_arg else None
 RUN_START       = time.time()
 
-# --workers N: number of parallel detail-scraping processes (default: CPU count, capped at 6)
-_workers_arg  = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--workers"), None)
+_workers_arg   = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--workers"), None)
 DETAIL_WORKERS = int(_workers_arg) if _workers_arg else min(os.cpu_count() or 4, 8)
+
+_sr_conc_arg   = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--spareroom-concurrency"), None)
+SR_CONCURRENCY = int(_sr_conc_arg) if _sr_conc_arg else 8
+
+_sr_csv_arg  = next((sys.argv[i+1] for i, a in enumerate(sys.argv) if a == "--spareroom-csv"), None)
 
 def time_is_up() -> bool:
     return TIME_LIMIT_SECS is not None and (time.time() - RUN_START) >= TIME_LIMIT_SECS
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-BASE_DIR    = Path(__file__).resolve().parent
-PARQUET_DIR = BASE_DIR / "parquet"
-DATA_DIR    = BASE_DIR / "data"
-PARQUET_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-SHARD_ROWS  = 5000
-STATE_FILE  = BASE_DIR / "state.json"
+
+SHARD_ROWS = 5000
+STATE_FILE = BASE_DIR / "state.json"
 
 OUTCODE_CSV = os.environ.get(
     "OUTCODE_CSV",
     r"C:\rightmove_monitor\scraper\outercode_to_postcode_master.csv",
 )
 
-PAGE_SIZE   = 24
-MAX_PAGES   = 50
+SPAREROOM_CSV = (
+    _sr_csv_arg
+    or os.environ.get("SPAREROOM_CSV", "")
+    or r"C:\rightmove_monitor\spareroom\postcodes.csv"
+)
+
+PAGE_SIZE = 24
+MAX_PAGES = 50
 
 # HMO analysis
 HMO_EMAIL_TO        = os.environ.get("HMO_EMAIL_TO", "")
 HMO_PRICE_THRESHOLD = 220_000
-# Property types that can physically be HMOs (exclude flats/maisonettes)
-_HOUSE_TYPE_PAT = r"detach|semi|terrace|bungalow|town.house|cottage|villa|barn"
+_HOUSE_TYPE_PAT     = r"detach|semi|terrace|bungalow|town.house|cottage|villa|barn"
+
+# URL collection concurrency
+URL_CONCURRENCY = 20
+
+# Detail scraping concurrency per worker process
+START_CONCURRENCY = 20
+MAX_CONCURRENCY   = 30
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Firefox/122.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121 Safari/537.36",
+]
+
+AUCTION_RE = re.compile(r"\bauction\b", re.IGNORECASE)
+HMO_RE     = re.compile(r"\bH\.?\s*M\.?\s*O\.?\b", re.IGNORECASE)
+TAG_RE     = re.compile(r"<[^>]+>")
+
 
 # ============================================================
 # REFERENCE DATA  (for HMO hotspot scoring)
@@ -348,7 +390,7 @@ UK_STATIONS = [
     ("Belfast Central",         54.5974, -5.9169),
 ]
 
-# Estimated monthly room rent (£) by outcode alpha-prefix
+# Estimated monthly room rent (£) by outcode alpha-prefix (fallback when no SpareRoom data)
 OUTCODE_ROOM_RENTS: dict[str, int] = {
     # London inner
     "E": 950, "EC": 1050, "N": 900, "NW": 900,
@@ -399,15 +441,12 @@ OUTCODE_ROOM_RENTS: dict[str, int] = {
 }
 
 # ── Scoring breakpoints ───────────────────────────────────────────────────────
-# Each list is (threshold, score); first threshold that the value is ≤ (for
-# distance / price) or ≥ (for yield / density) wins; fallback is 0.
-
-_UNI_BP    = [(1, 10), (2, 9), (3, 8), (5, 6), (8, 4), (12, 2)]   # km
-_HOSP_BP   = [(1, 10), (2, 8), (3, 6), (5, 4), (8, 2)]             # km
-_STA_BP    = [(0.5, 10), (1, 9), (2, 7), (3, 5), (5, 3), (8, 1)]  # km
-_YIELD_BP  = [(15, 10), (12, 8), (10, 6), (8, 4), (6, 2)]          # % gross yield
-_DENS_BP   = [(20, 10), (15, 8), (10, 6), (5, 4), (2, 2)]          # % already-HMO
-_AFFORD_BP = [                                                       # £ median
+_UNI_BP    = [(1, 10), (2, 9), (3, 8), (5, 6), (8, 4), (12, 2)]
+_HOSP_BP   = [(1, 10), (2, 8), (3, 6), (5, 4), (8, 2)]
+_STA_BP    = [(0.5, 10), (1, 9), (2, 7), (3, 5), (5, 3), (8, 1)]
+_YIELD_BP  = [(15, 10), (12, 8), (10, 6), (8, 4), (6, 2)]
+_DENS_BP   = [(20, 10), (15, 8), (10, 6), (5, 4), (2, 2)]
+_AFFORD_BP = [
     (100_000, 10), (130_000, 9), (150_000, 8), (170_000, 7),
     (190_000, 6),  (210_000, 5), (220_000, 4), (250_000, 3), (300_000, 1),
 ]
@@ -420,26 +459,6 @@ _SCORE_WEIGHTS = {
     "hospital":      0.07,
     "affordability": 0.03,
 }
-
-# URL collection concurrency
-URL_CONCURRENCY = 20
-
-# Detail scraping concurrency per worker process
-# 8 workers × 20 = 160 total connections — aggressive but not likely to trigger 429s
-START_CONCURRENCY = 20
-MAX_CONCURRENCY   = 30
-
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Firefox/122.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121 Safari/537.36",
-]
-
-AUCTION_RE = re.compile(r"\bauction\b", re.IGNORECASE)
-HMO_RE     = re.compile(r"\bH\.?\s*M\.?\s*O\.?\b", re.IGNORECASE)
-TAG_RE     = re.compile(r"<[^>]+>")
 
 
 # ============================================================
@@ -455,12 +474,10 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _nearest_km(lat: float, lon: float, pois: list) -> float:
-    """Minimum haversine distance in km from (lat, lon) to any POI in list."""
     return min(haversine_km(lat, lon, p[1], p[2]) for p in pois)
 
 
 def _score_lower_better(value: float, breakpoints: list) -> int:
-    """Return score where a lower value is better (distances, prices)."""
     for threshold, score in breakpoints:
         if value <= threshold:
             return score
@@ -468,7 +485,6 @@ def _score_lower_better(value: float, breakpoints: list) -> int:
 
 
 def _score_higher_better(value: float, breakpoints: list) -> int:
-    """Return score where a higher value is better (yield, density)."""
     for threshold, score in sorted(breakpoints, reverse=True):
         if value >= threshold:
             return score
@@ -476,13 +492,20 @@ def _score_higher_better(value: float, breakpoints: list) -> int:
 
 
 def _get_room_rent(outcode: str) -> int:
-    """Look up estimated monthly room rent (£) for an outcode."""
     prefix = re.match(r"^([A-Z]+)", (outcode or "").upper())
     if not prefix:
         return 420
     key = prefix.group(1)
-    # Try 2-letter prefix first (e.g. "NW"), then 1-letter fallback
     return OUTCODE_ROOM_RENTS.get(key, OUTCODE_ROOM_RENTS.get(key[:1], 420))
+
+
+def _safe_float(x) -> float | None:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 
 def html_to_text(s: str) -> str:
@@ -518,7 +541,7 @@ def get_description_text_from_model(model: dict) -> str:
 
 
 # ============================================================
-# STATE
+# RIGHTMOVE STATE
 # ============================================================
 
 def load_state():
@@ -561,21 +584,14 @@ def load_outcodes():
 
 
 # ============================================================
-# URL COLLECTION  (HTML-based, no browser)
+# RIGHTMOVE URL COLLECTION
 # ============================================================
 
-# Matches /properties/12345678 hrefs in search result HTML
 PROPERTY_ID_RE = re.compile(r'href="(/properties/(\d+))[^"]*"')
-
 SEARCH_URL = "https://www.rightmove.co.uk/property-for-sale/find.html"
 
 
 async def fetch_search_page(session, outcode_id, index):
-    """
-    Fetch a search results HTML page and extract property URLs via regex.
-    Rightmove server-renders the property card links in the initial HTML,
-    so no browser is needed.
-    """
     params = {
         "locationIdentifier": outcode_id,
         "sortType":           1,
@@ -595,12 +611,10 @@ async def fetch_search_page(session, outcode_id, index):
                     continue
                 if resp.status != 200:
                     return set(), resp.status, 0
-
                 html = await resp.text()
                 ids  = {m.group(2) for m in PROPERTY_ID_RE.finditer(html)}
                 urls = {f"https://www.rightmove.co.uk/properties/{i}" for i in ids}
                 return urls, resp.status, 0
-
         except Exception as e:
             if attempt == 0:
                 print(f"\nSearch page error for {outcode_id} index={index}: {e}")
@@ -614,23 +628,15 @@ async def collect_urls_for_outcode(session, outcode_id, sem):
         for page_idx in range(MAX_PAGES):
             index = page_idx * PAGE_SIZE
             urls, status, _ = await fetch_search_page(session, outcode_id, index)
-
             if status in (None, 403, 503):
                 return outcode_id, all_urls, False
-
             new_urls = urls - all_urls
             if not new_urls:
-                # Empty page or all duplicates — end of results
                 break
-
             all_urls.update(new_urls)
-
-            # If the page returned fewer than a full page, this was the last page
             if len(urls) < PAGE_SIZE:
                 break
-
             await asyncio.sleep(random.uniform(0.3, 0.7))
-
         return outcode_id, all_urls, True
 
 
@@ -643,9 +649,9 @@ async def collect_all_urls(outcodes, state):
     timeout   = aiohttp.ClientTimeout(total=30)
     sem       = asyncio.Semaphore(URL_CONCURRENCY)
 
-    total     = len(outcodes)
-    done      = 0
-    start     = time.time()
+    total = len(outcodes)
+    done  = 0
+    start = time.time()
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         tasks = [collect_urls_for_outcode(session, oc, sem) for oc in outcodes]
@@ -665,7 +671,7 @@ async def collect_all_urls(outcodes, state):
             elapsed = time.time() - start
             eta = (elapsed / done * total) - elapsed if done > 5 else 0
             eta = min(max(eta, 0), 7200)
-            pct = int(done / total * 100)
+            pct  = int(done / total * 100)
             fill = int(30 * done / total)
             bar  = "#" * fill + "-" * (30 - fill)
             print(
@@ -684,7 +690,7 @@ async def collect_all_urls(outcodes, state):
 
 
 # ============================================================
-# DETAIL SCRAPER  (unchanged from v4)
+# RIGHTMOVE DETAIL SCRAPER
 # ============================================================
 
 def extract_page_model(html: str):
@@ -763,18 +769,18 @@ def normalize_row(url, model, status, description_text=""):
         lon = analytics.get("longitude") or analytics.get("lng") or lon
 
     return {
-        "url":              url,
-        "address":          addr.get("displayAddress"),
-        "postcode":         analytics.get("postcode") or f"{outcode} {incode}".strip(),
-        "price":            analytics.get("price"),
-        "bedrooms":         prop.get("bedrooms"),
-        "property_type":    prop.get("propertySubType") or prop.get("propertyType"),
-        "floor_area":       fa,
-        "latitude":         lat,
-        "longitude":        lon,
-        "status":           int(status) if str(status).isdigit() else None,
+        "url":               url,
+        "address":           addr.get("displayAddress"),
+        "postcode":          analytics.get("postcode") or f"{outcode} {incode}".strip(),
+        "price":             analytics.get("price"),
+        "bedrooms":          prop.get("bedrooms"),
+        "property_type":     prop.get("propertySubType") or prop.get("propertyType"),
+        "floor_area":        fa,
+        "latitude":          lat,
+        "longitude":         lon,
+        "status":            int(status) if str(status).isdigit() else None,
         "potential_auction": potential_auction,
-        "potential_hmo":    potential_hmo,
+        "potential_hmo":     potential_hmo,
     }
 
 
@@ -815,10 +821,6 @@ async def fetch_detail(session, url):
 
 
 async def scrape_details(urls, label, concurrency, result_list, state, progress_queue=None):
-    """
-    Scrape detail pages. If progress_queue is provided (multiprocessing mode),
-    progress updates are sent through it instead of printed directly.
-    """
     urls  = list(set(urls))
     total = len(urls)
     if not total:
@@ -890,7 +892,6 @@ async def scrape_details(urls, label, concurrency, result_list, state, progress_
 
 
 def detail_worker(urls, worker_id, result_queue, state_snapshot):
-    """Runs in a worker process — own asyncio loop, sends rows + progress to result_queue."""
     async def _run():
         state = {
             "collected_urls":     set(state_snapshot["collected_urls"]),
@@ -922,13 +923,12 @@ def detail_worker(urls, worker_id, result_queue, state_snapshot):
 
 
 # ============================================================
-# PROGRESS TABLE  (rendered by the writer thread)
+# RIGHTMOVE PROGRESS TABLE
 # ============================================================
 
 def _render_table(workers: dict, table_printed: bool) -> None:
-    n_rows = len(workers) + 2  # header + divider + one row per worker
+    n_rows = len(workers) + 2
     if table_printed:
-        # Move cursor up to overwrite previous table
         sys.stdout.write(f"\033[{n_rows}A")
 
     header = f"{'Worker':<10} {'Pass':<5} {'Progress':<32} {'Done':>8} {'Total':>8} {'ERR':>5} {'ETA':>6}"
@@ -950,12 +950,11 @@ def _render_table(workers: dict, table_printed: bool) -> None:
 
 
 def writer_thread_func(result_queue, shard_dir, expected_done, state):
-    """Collects rows + progress updates from workers, renders table, writes shards."""
-    rows_buf     = []
-    shard_index  = 0
-    done_count   = 0
-    processed    = 0
-    workers      = {}       # worker_id -> progress state
+    rows_buf      = []
+    shard_index   = 0
+    done_count    = 0
+    processed     = 0
+    workers       = {}
     table_printed = False
 
     def flush():
@@ -966,7 +965,6 @@ def writer_thread_func(result_queue, shard_dir, expected_done, state):
         table = pa.Table.from_pandas(df, preserve_index=False)
         out   = shard_dir / f"rightmove_part_{shard_index:05d}.parquet"
         pq.write_table(table, out, compression=None)
-        # Print below the progress table
         sys.stdout.write(f"Wrote shard -> {out.name} ({len(df):,} rows)\n")
         sys.stdout.flush()
         rows_buf.clear()
@@ -975,17 +973,14 @@ def writer_thread_func(result_queue, shard_dir, expected_done, state):
     while True:
         item = result_queue.get()
 
-        # ---- worker finished ----
         if isinstance(item, str) and item.startswith("DONE-"):
             done_count += 1
             if done_count >= expected_done:
                 break
             continue
 
-        # ---- progress update ----
         if isinstance(item, dict) and item.get("_type") == "progress":
             label = item["label"]
-            # label is like "W3-P1" — extract worker id and pass
             parts = label.split("-")
             wid   = int(parts[0][1:])
             pass_ = parts[1] if len(parts) > 1 else "P1"
@@ -1001,7 +996,6 @@ def writer_thread_func(result_queue, shard_dir, expected_done, state):
             table_printed = True
             continue
 
-        # ---- property row ----
         rows_buf.append(item)
         url = item.get("url")
         if url and item.get("status") == 200:
@@ -1020,7 +1014,7 @@ def writer_thread_func(result_queue, shard_dir, expected_done, state):
 
 
 # ============================================================
-# PARQUET WRITER
+# RIGHTMOVE PARQUET HELPERS
 # ============================================================
 
 def final_parquet_name():
@@ -1034,7 +1028,6 @@ def consolidate_shards(shard_dir, output_path):
         print("No shards to consolidate.")
         return
     print(f"\nConsolidating {len(shard_files)} shards -> {output_path}")
-
     df = pd.concat(
         [pd.read_parquet(f) for f in shard_files],
         ignore_index=True,
@@ -1053,44 +1046,338 @@ def flush_shard(rows, shard_dir, shard_index):
 
 
 # ============================================================
-# POST-RUN HELPERS
+# SPAREROOM SCRAPER
 # ============================================================
 
-def clear_state():
-    """Reset state.json and remove all parquet shards."""
-    empty = {"completed_outcodes": [], "collected_urls": [], "seen_urls": []}
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(empty, f, indent=2)
-    print("State cleared.")
+SR_BASE_URL   = "https://www.spareroom.co.uk/flatshare/search.pl"
+SR_DETAIL_URL = "https://www.spareroom.co.uk/flatshare/flatshare_detail.pl"
+SR_PAGE_SIZE  = 200
 
-    shards_root = PARQUET_DIR / "shards"
-    if shards_root.exists():
-        import shutil
-        shutil.rmtree(shards_root)
-        print(f"Shards directory removed.")
+_SR_LOCATION_RE = re.compile(
+    r"location\s*:\s*\{[^}]*?latitude\s*:\s*\"(?P<lat>[-0-9.]+)\"\s*,\s*longitude\s*:\s*\"(?P<lng>[-0-9.]+)\"",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_SR_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Referer":         "https://www.spareroom.co.uk/",
+}
 
 
-def push_to_github(parquet_path: Path):
-    """Stage the output parquet and push to origin/main."""
-    def run(cmd):
-        result = subprocess.run(cmd, cwd=BASE_DIR, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"git error: {result.stderr.strip()}")
-            return False
-        return True
+def _sr_extract_flatshare_id(url: str) -> str | None:
+    if not url:
+        return None
+    qs = parse_qs(urlparse(url).query)
+    return qs.get("flatshare_id", [None])[0]
 
-    datestamp = time.strftime("%Y-%m-%d")
-    run(["git", "config", "user.email", "scraper@rightmove-dash"])
-    run(["git", "config", "user.name",  "scraper"])
-    run(["git", "add",    str(parquet_path)])
-    committed = run(["git", "commit", "-m", f"data: scrape {datestamp}"])
-    if not committed:
-        print("Nothing to commit — parquet unchanged.")
+
+def _sr_extract_lat_lng(html: str) -> tuple[float | None, float | None]:
+    m = _SR_LOCATION_RE.search(html or "")
+    if not m:
+        return None, None
+    return _safe_float(m.group("lat")), _safe_float(m.group("lng"))
+
+
+def _sr_load_state(state_file: Path) -> dict:
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return {
+                "completed_postcodes": set(d.get("completed_postcodes", [])),
+                "failed_postcodes":    list(d.get("failed_postcodes", [])),
+            }
+        except Exception:
+            pass
+    return {"completed_postcodes": set(), "failed_postcodes": []}
+
+
+def _sr_save_state(state: dict, state_file: Path):
+    data = {
+        "completed_postcodes": sorted(list(state["completed_postcodes"])),
+        "failed_postcodes":    state["failed_postcodes"],
+    }
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _sr_load_postcodes(csv_path: str) -> list[str]:
+    df = pd.read_csv(csv_path)
+    col = "Postcode" if "Postcode" in df.columns else df.columns[0]
+    return df[col].dropna().astype(str).str.strip().str.upper().unique().tolist()
+
+
+async def _sr_fetch_detail_coords(
+    session: aiohttp.ClientSession,
+    flatshare_id: str,
+    flatshare_type: str,
+) -> tuple[float | None, float | None]:
+    params = {"flatshare_id": flatshare_id, "flatshare_type": flatshare_type, "mode": "details"}
+    for attempt in range(2):
+        headers = dict(_SR_HEADERS)
+        headers["User-Agent"] = random.choice(USER_AGENTS)
+        try:
+            async with session.get(SR_DETAIL_URL, params=params, headers=headers) as r:
+                if r.status != 200:
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                return _sr_extract_lat_lng(await r.text())
+        except Exception:
+            await asyncio.sleep(0.2 * (attempt + 1))
+    return None, None
+
+
+async def _sr_enrich_coords(
+    session: aiohttp.ClientSession,
+    rows: list[dict],
+    flatshare_type: str,
+    max_concurrent: int = 12,
+):
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _one(row: dict):
+        fid = row.get("flatshare_id")
+        if not fid:
+            row["latitude"] = row["longitude"] = None
+            return
+        async with sem:
+            lat, lng = await _sr_fetch_detail_coords(session, str(fid), flatshare_type)
+            row["latitude"]  = lat
+            row["longitude"] = lng
+            await asyncio.sleep(random.uniform(0.05, 0.12))
+
+    await asyncio.gather(*(_one(r) for r in rows))
+
+
+class _SpareRoomScraper:
+    DOMAIN = "https://www.spareroom.co.uk"
+
+    def __init__(self, postcode: str, session: aiohttp.ClientSession, flatshare_type: str):
+        self.postcode       = postcode
+        self.session        = session
+        self.flatshare_type = flatshare_type
+
+    async def _fetch_page(self, offset: int) -> tuple[int, str | None]:
+        params = {
+            "action":          "search",
+            "flatshare_type":  self.flatshare_type,
+            "search":          self.postcode,
+            "max_per_page":    SR_PAGE_SIZE,
+            "offset":          offset,
+        }
+        headers = dict(_SR_HEADERS)
+        headers["User-Agent"] = random.choice(USER_AGENTS)
+        try:
+            async with self.session.get(SR_BASE_URL, params=params, headers=headers) as r:
+                return r.status, (await r.text() if r.status == 200 else None)
+        except Exception:
+            return 0, None
+
+    def _parse_listing(self, li, soup_module) -> dict | None:
+        try:
+            title     = li.find("h2",   class_="listing-card__title")
+            link      = li.find("a",    class_="listing-card__link")
+            price     = li.find("p",    class_="listing-card__price")
+            location  = li.find("p",    class_="listing-card__location")
+            room_type = li.find("span", class_="listing-card__room")
+            avail     = li.find("span", class_="listing-card__availability")
+
+            url = None
+            if link and link.has_attr("href"):
+                href = link["href"]
+                url  = href if href.startswith("http") else (self.DOMAIN + href)
+
+            flatshare_id = _sr_extract_flatshare_id(url)
+
+            price_text = price.get_text(" ", strip=True) if price else ""
+            pw_price = pcm_price = None
+            if price_text:
+                lt  = price_text.lower()
+                tok = price_text.split()[0] if price_text.split() else None
+                if tok:
+                    if "pw"  in lt: pw_price  = tok
+                    elif "pcm" in lt: pcm_price = tok
+
+            return {
+                "postcode":     self.postcode,
+                "title":        title.get_text(strip=True) if title else None,
+                "url":          url,
+                "flatshare_id": flatshare_id,
+                "pw_price":     pw_price,
+                "pcm_price":    pcm_price,
+                "location":     location.get_text(strip=True) if location else None,
+                "room_type":    room_type.get_text(strip=True) if room_type else None,
+                "available":    avail.get_text(strip=True) if avail else None,
+                "latitude":     None,
+                "longitude":    None,
+            }
+        except Exception:
+            return None
+
+    async def scrape_all(self) -> tuple[list[dict], int]:
+        if not _BS4_AVAILABLE:
+            print("bs4 not installed — skipping SpareRoom scrape. Run: pip install beautifulsoup4")
+            return [], 0
+
+        rows: list[dict] = []
+        seen_ids: set[str] = set()
+        last_status = 200
+        offset = 0
+        no_new_streak = 0
+
+        for page in range(200):
+            status, html = await self._fetch_page(offset)
+            last_status = status or last_status
+            if not html:
+                break
+
+            soup     = BeautifulSoup(html, "html.parser")
+            listings = soup.find_all("li", class_="listing-result")
+            if not listings:
+                break
+
+            new_this_page = 0
+            for li in listings:
+                row = self._parse_listing(li, BeautifulSoup)
+                if not row:
+                    continue
+                fid = row.get("flatshare_id")
+                if not fid or fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
+                rows.append(row)
+                new_this_page += 1
+
+            no_new_streak = 0 if new_this_page else no_new_streak + 1
+            if no_new_streak >= 3:
+                break
+
+            offset += SR_PAGE_SIZE
+            if page % 2 == 0:
+                await asyncio.sleep(random.uniform(0.08, 0.18))
+
+        return rows, last_status
+
+
+def _sr_normalize(row: dict) -> dict:
+    return {
+        "source":       "spareroom",
+        "postcode":     str(row.get("postcode") or ""),
+        "title":        str(row.get("title") or ""),
+        "url":          str(row.get("url") or ""),
+        "flatshare_id": str(row.get("flatshare_id") or ""),
+        "pw_price":     str(row.get("pw_price") or ""),
+        "pcm_price":    str(row.get("pcm_price") or ""),
+        "location":     str(row.get("location") or ""),
+        "room_type":    str(row.get("room_type") or ""),
+        "available":    str(row.get("available") or ""),
+        "latitude":     row.get("latitude"),
+        "longitude":    row.get("longitude"),
+        "scraped_at":   pd.Timestamp.utcnow(),
+    }
+
+
+async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
+    """Scrape SpareRoom for one flatshare_type ('offered' or 'wanted')."""
+    if not Path(SPAREROOM_CSV).exists():
+        print(f"SpareRoom CSV not found: {SPAREROOM_CSV} — skipping.")
         return
-    if run(["git", "push"]):
-        print(f"Pushed {parquet_path.name} to GitHub.")
+
+    output_dir = DATA_DIR / f"spareroom_{flatshare_type}"
+    output_dir.mkdir(exist_ok=True)
+    state_file = BASE_DIR / f"state_spareroom_{flatshare_type}.json"
+
+    postcodes = _sr_load_postcodes(SPAREROOM_CSV)
+    state     = _sr_load_state(state_file)
+
+    if retry_failed and state["failed_postcodes"]:
+        remaining = state["failed_postcodes"]
+        state["failed_postcodes"] = []
     else:
-        print("Push failed — check git credentials.")
+        remaining = [pc for pc in postcodes if pc not in state["completed_postcodes"]]
+
+    total = len(remaining)
+    if total == 0:
+        print(f"SpareRoom {flatshare_type}: nothing to scrape.")
+        return
+
+    print(f"\nSpareRoom {flatshare_type} — {total:,} postcodes, concurrency={SR_CONCURRENCY}")
+
+    batch:     list[dict] = []
+    seen_keys: set[str]   = set()
+    deduped    = 0
+    done       = 0
+    total_rows = 0
+    shard_idx  = 0
+    start_ts   = time.time()
+
+    def flush_batch():
+        nonlocal shard_idx, batch
+        if not batch:
+            return
+        df  = pd.DataFrame(batch)
+        ts  = int(time.time() * 1000)
+        out = output_dir / f"spareroom_shard_{ts}.parquet"
+        df.to_parquet(str(out) + ".tmp", index=False)
+        os.replace(str(out) + ".tmp", out)
+        print(f"\nWrote SpareRoom shard -> {out.name} ({len(df):,} rows)")
+        batch = []
+        shard_idx += 1
+
+    sem       = asyncio.Semaphore(SR_CONCURRENCY)
+    connector = aiohttp.TCPConnector(limit=max(20, SR_CONCURRENCY * 2), limit_per_host=max(4, SR_CONCURRENCY))
+    timeout   = aiohttp.ClientTimeout(total=45, sock_connect=10, sock_read=30)
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+
+        async def worker(pc: str):
+            nonlocal done, total_rows, deduped
+
+            async with sem:
+                scraper = _SpareRoomScraper(pc, session, flatshare_type)
+                rows, status = await scraper.scrape_all()
+
+                await _sr_enrich_coords(session, rows, flatshare_type)
+
+                for r in rows:
+                    fid = r.get("flatshare_id")
+                    key = ("spareroom", str(fid), str(pc))
+                    if not fid or key in seen_keys:
+                        deduped += 1
+                        continue
+                    seen_keys.add(key)
+                    batch.append(_sr_normalize(r))
+                    if len(batch) >= 5000:
+                        flush_batch()
+
+                if status == 200:
+                    state["completed_postcodes"].add(pc)
+                else:
+                    state["failed_postcodes"].append(pc)
+
+                total_rows += len(rows)
+                done += 1
+
+                frac = done / total
+                elapsed = time.time() - start_ts
+                eta = max(0, int((elapsed / max(frac, 1e-9)) - elapsed)) if done > 5 else 0
+                fill = int(30 * frac)
+                bar  = "#" * fill + "-" * (30 - fill)
+                print(
+                    f"[SR-{flatshare_type} {bar}] {int(frac*100)}% ({done:,}/{total:,})"
+                    f" | ETA {eta//60:02d}:{eta%60:02d}",
+                    end="\r", flush=True,
+                )
+
+                if done % 25 == 0:
+                    _sr_save_state(state, state_file)
+
+        await asyncio.gather(*(worker(pc) for pc in remaining))
+
+    flush_batch()
+    _sr_save_state(state, state_file)
+    print(f"\nSpareRoom {flatshare_type} done — {total_rows:,} rows, {deduped:,} deduped")
 
 
 # ============================================================
@@ -1099,13 +1386,11 @@ def push_to_github(parquet_path: Path):
 
 def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
     """
-    Read SpareRoom offered-room parquet shards from offered/ and return
-    outcode → median monthly rent (£).  Outcodes with fewer than
-    min_listings are excluded so thin samples don't distort the yield calc.
-    Returns an empty dict if no SpareRoom data has been scraped yet,
-    in which case the static OUTCODE_ROOM_RENTS table is used as fallback.
+    Read SpareRoom offered-room parquet shards from data/spareroom_offered/
+    and return outcode -> median monthly rent (£).
+    Falls back to an empty dict if no data has been scraped yet.
     """
-    offered_dir = BASE_DIR / "offered"
+    offered_dir = DATA_DIR / "spareroom_offered"
     shards = sorted(offered_dir.glob("spareroom_shard_*.parquet")) if offered_dir.exists() else []
     if not shards:
         return {}
@@ -1146,9 +1431,7 @@ def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
                 pass
         return None
 
-    df["monthly_rent"] = df.apply(
-        lambda r: _to_monthly(r["pcm_price"], r["pw_price"]), axis=1
-    )
+    df["monthly_rent"] = df.apply(lambda r: _to_monthly(r["pcm_price"], r["pw_price"]), axis=1)
     df = df.dropna(subset=["monthly_rent"])
     df["outcode"] = df["postcode"].fillna("").str.split().str[0].str.upper()
     df = df[df["outcode"].notna() & (df["outcode"] != "")]
@@ -1157,7 +1440,6 @@ def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
     for oc, grp in df.groupby("outcode"):
         if len(grp) >= min_listings:
             rents[oc] = round(grp["monthly_rent"].median(), 0)
-
     return rents
 
 
@@ -1168,14 +1450,16 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     Candidate criteria:
       - 3+ bedrooms, house type (not flat), not already marketed as HMO
 
-    Hotspot composite score (0–10, weighted sum of six signals):
-      university proximity  30%  — tenant demand from students
-      estimated gross yield 25%  — (room_rent × beds × 12) / price
-      HMO market density    20%  — % of houses in outcode already listed as HMO
-                                   (proves demand without implying saturation)
-      transport proximity   15%  — distance to nearest major rail/metro station
-      hospital proximity     7%  — demand from NHS staff / key workers
-      affordability          3%  — median price vs £220 k cap
+    Hotspot composite score (0-10, weighted sum of six signals):
+      university proximity  30%  - tenant demand from students
+      estimated gross yield 25%  - (room_rent x beds x 12) / price
+      HMO market density    20%  - % of houses in outcode already listed as HMO
+      transport proximity   15%  - distance to nearest major rail/metro station
+      hospital proximity     7%  - demand from NHS staff / key workers
+      affordability          3%  - median price vs £220k cap
+
+    Room rent uses live SpareRoom outcode medians where available,
+    falling back to the regional OUTCODE_ROOM_RENTS table.
     """
     df = df.copy()
     df["price_num"] = pd.to_numeric(df["price"], errors="coerce")
@@ -1194,20 +1478,16 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
 
     five_plus = df[df["beds_num"] >= 5].copy()
 
-    # ── SpareRoom live rent data (outcode → median £/month) ───────────────────
     spareroom_rents = load_spareroom_rents()
 
-    # ── Per-outcode stats ─────────────────────────────────────────────────────
     all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
 
-    # Centroid: average lat/lon of all scraped properties per outcode
     centroids = (
         all_houses.dropna(subset=["latitude", "longitude"])
         .groupby("outcode")
         .agg(lat=("latitude", "mean"), lon=("longitude", "mean"))
     )
 
-    # HMO density: already-HMO houses as % of all houses in outcode
     hmo_counts   = all_houses[all_houses["potential_hmo"].fillna(False)].groupby("outcode").size()
     house_counts = all_houses.groupby("outcode").size()
     hmo_density  = (hmo_counts / house_counts * 100).fillna(0).rename("hmo_density_pct")
@@ -1225,23 +1505,23 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         )
     )
 
-    # ── Scoring ───────────────────────────────────────────────────────────────
     rows = []
     for oc, row in agg.iterrows():
         if oc not in centroids.index:
             continue
-        lat, lon = centroids.loc[oc, "lat"], centroids.loc[oc, "lon"]
+        lat, lon  = centroids.loc[oc, "lat"], centroids.loc[oc, "lon"]
         med_price = row["median_price"]
         avg_beds  = row["avg_beds"]
+
         if oc in spareroom_rents:
             room_rent   = spareroom_rents[oc]
             rent_source = "spareroom"
         else:
             room_rent   = _get_room_rent(oc)
             rent_source = "regional"
-        density   = hmo_density.get(oc, 0.0)
 
-        # Gross yield estimate: (annual room income) / purchase price × 100
+        density = hmo_density.get(oc, 0.0)
+
         est_yield = (
             (room_rent * avg_beds * 12) / med_price * 100
             if pd.notna(med_price) and med_price > 0 else 0.0
@@ -1251,12 +1531,12 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         dist_hosp = _nearest_km(lat, lon, UK_HOSPITALS)
         dist_sta  = _nearest_km(lat, lon, UK_STATIONS)
 
-        s_uni    = _score_lower_better(dist_uni,   _UNI_BP)
-        s_hosp   = _score_lower_better(dist_hosp,  _HOSP_BP)
-        s_sta    = _score_lower_better(dist_sta,   _STA_BP)
-        s_yield  = _score_higher_better(est_yield, _YIELD_BP)
-        s_dens   = _score_higher_better(density,   _DENS_BP)
-        s_afford = _score_lower_better(med_price or 999_999, _AFFORD_BP)
+        s_uni    = _score_lower_better(dist_uni,              _UNI_BP)
+        s_hosp   = _score_lower_better(dist_hosp,             _HOSP_BP)
+        s_sta    = _score_lower_better(dist_sta,              _STA_BP)
+        s_yield  = _score_higher_better(est_yield,            _YIELD_BP)
+        s_dens   = _score_higher_better(density,              _DENS_BP)
+        s_afford = _score_lower_better(med_price or 999_999,  _AFFORD_BP)
 
         composite = (
             s_uni    * _SCORE_WEIGHTS["university"]
@@ -1296,15 +1576,10 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         .reset_index(drop=True)
     )
 
-    # Attach outcode score to affordable candidates for email
     score_map = hotspots.set_index("outcode")["composite_score"].to_dict()
-    affordable = hmo_candidates[
-        hmo_candidates["price_num"] < HMO_PRICE_THRESHOLD
-    ].copy()
+    affordable = hmo_candidates[hmo_candidates["price_num"] < HMO_PRICE_THRESHOLD].copy()
     affordable["hmo_score"] = affordable["outcode"].map(score_map)
-    affordable = affordable.sort_values(
-        ["hmo_score", "price_num"], ascending=[False, True]
-    )
+    affordable = affordable.sort_values(["hmo_score", "price_num"], ascending=[False, True])
 
     return {
         "total":          len(df),
@@ -1325,13 +1600,13 @@ def print_metrics_report(analysis: dict) -> None:
     band_mid  = ((p >= HMO_PRICE_THRESHOLD) & (p < 350_000)).sum()
     band_high = (p >= 350_000).sum()
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 72)
     print("  HMO OPPORTUNITY ANALYSIS")
-    print("=" * 64)
+    print("=" * 72)
     print(f"  Total properties scraped      : {analysis['total']:>8,}")
     print(f"  HMO conversion candidates     : {len(cands):>8,}  (3+ bed house, non-HMO)")
     print(f"    Under £{HMO_PRICE_THRESHOLD:,}               : {len(aff):>8,}")
-    print(f"    £{HMO_PRICE_THRESHOLD:,} – £350,000          : {band_mid:>8,}")
+    print(f"    £{HMO_PRICE_THRESHOLD:,} - £350,000          : {band_mid:>8,}")
     print(f"    Over £350,000                : {band_high:>8,}")
     print(f"  5+ bed properties (all types) : {len(five_plus):>8,}")
     if len(cands) > 0 and p.notna().any():
@@ -1343,9 +1618,8 @@ def print_metrics_report(analysis: dict) -> None:
 
     if len(hot) > 0:
         sr_count = (hot["rent_source"] == "spareroom").sum() if "rent_source" in hot.columns else 0
-        total_oc = len(hot)
-        print(f"\n  Rent data: {sr_count}/{total_oc} hotspot outcodes use live SpareRoom data"
-              f" ({total_oc - sr_count} use regional fallback)")
+        print(f"\n  Rent data: {sr_count}/{len(hot)} outcodes use live SpareRoom data"
+              f" ({len(hot) - sr_count} use regional fallback)")
         print(f"\n  TOP HMO HOTSPOTS  (ranked by composite investment score)")
         hdr = (
             f"  {'#':<3}  {'Area':<7}  {'Score':>5}  {'Count':>5}  "
@@ -1354,18 +1628,18 @@ def print_metrics_report(analysis: dict) -> None:
         )
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
-        for _, row in hot.iterrows():
+        for i, row in hot.iterrows():
             med = f"£{row['median_price']:,.0f}" if pd.notna(row["median_price"]) else "N/A"
             src = "SR" if row.get("rent_source") == "spareroom" else "est"
             print(
-                f"  {_+1:<3}  {row['outcode']:<7}  {row['composite_score']:>5.2f}"
+                f"  {i+1:<3}  {row['outcode']:<7}  {row['composite_score']:>5.2f}"
                 f"  {row['opportunities']:>5,}  {med:>9}"
                 f"  £{row['room_rent']:>5,}  {src:<3}  {row['est_yield']:>4.1f}%"
                 f"  {row['hmo_density']:>4.1f}%"
                 f"  {row['dist_uni_km']:>6.1f}  {row['dist_sta_km']:>6.1f}"
                 f"  {row['under_220k']:>5,}"
             )
-    print("=" * 64 + "\n")
+    print("=" * 72 + "\n")
 
 
 def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
@@ -1373,10 +1647,8 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
 
     hotspot_rows = ""
     for i, row in hotspots.iterrows():
-        med    = f"£{row['median_price']:,.0f}" if pd.notna(row["median_price"]) else "—"
+        med    = f"£{row['median_price']:,.0f}" if pd.notna(row["median_price"]) else "-"
         score  = row["composite_score"]
-        # Colour-code score: green ≥7, amber ≥4, red <4
-        sc     = int(score * 10)
         colour = "#27ae60" if score >= 7 else ("#e67e22" if score >= 4 else "#c0392b")
         src_badge = (
             "<span style='background:#27ae60;color:#fff;padding:1px 5px;border-radius:3px;"
@@ -1387,33 +1659,29 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
         )
         hotspot_rows += (
             f"<tr>"
-            f"<td>{i+1}</td>"
-            f"<td><b>{row['outcode']}</b></td>"
+            f"<td>{i+1}</td><td><b>{row['outcode']}</b></td>"
             f"<td style='color:{colour};font-weight:bold'>{score:.2f}</td>"
-            f"<td>{int(row['opportunities']):,}</td>"
-            f"<td>{med}</td>"
+            f"<td>{int(row['opportunities']):,}</td><td>{med}</td>"
             f"<td>£{int(row['room_rent']):,}/mo {src_badge}</td>"
-            f"<td>{row['est_yield']:.1f}%</td>"
-            f"<td>{row['hmo_density']:.1f}%</td>"
-            f"<td>{row['dist_uni_km']:.1f} km</td>"
-            f"<td>{row['dist_sta_km']:.1f} km</td>"
+            f"<td>{row['est_yield']:.1f}%</td><td>{row['hmo_density']:.1f}%</td>"
+            f"<td>{row['dist_uni_km']:.1f} km</td><td>{row['dist_sta_km']:.1f} km</td>"
             f"<td>{int(row['under_220k']):,}</td>"
             f"</tr>\n"
         )
 
     property_rows = ""
     for _, r in affordable.head(100).iterrows():
-        price  = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "—"
-        beds   = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
-        addr   = r.get("address") or "View listing"
-        ptype  = r.get("property_type") or "—"
-        pc     = r.get("postcode") or "—"
-        score  = r.get("hmo_score")
-        score_str = f"{score:.1f}" if pd.notna(score) else "—"
-        auction_flag = " &#9873;" if r.get("potential_auction") else ""
+        price     = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "-"
+        beds      = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
+        addr      = r.get("address") or "View listing"
+        ptype     = r.get("property_type") or "-"
+        pc        = r.get("postcode") or "-"
+        score     = r.get("hmo_score")
+        score_str = f"{score:.1f}" if pd.notna(score) else "-"
+        flag      = " &#9873;" if r.get("potential_auction") else ""
         property_rows += (
             f"<tr>"
-            f"<td><a href='{r['url']}'>{addr}{auction_flag}</a></td>"
+            f"<td><a href='{r['url']}'>{addr}{flag}</a></td>"
             f"<td>{pc}</td><td>{price}</td><td>{beds}</td><td>{ptype}</td>"
             f"<td style='text-align:center'>{score_str}</td>"
             f"</tr>\n"
@@ -1424,14 +1692,14 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
   HMO Opportunity Report &mdash; {date_str}
 </h2>
 <p>HMO conversion candidates (3+ bed house, not already HMO) priced under
-<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties are sorted by area investment score, then price.</p>
-<p><b>{len(affordable):,} properties</b> meet the criteria.</p>
+<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties sorted by area score then price.</p>
+<p><b>{len(affordable):,} total candidates</b> — showing top 100.</p>
 
 <h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>
 <p style="font-size:0.85em;color:#555;">
-  Composite score (0–10) weights: university proximity 30% · estimated gross yield 25% ·
-  HMO market density 20% · transport 15% · hospital proximity 7% · affordability 3%.<br>
-  HMO density = % of houses in that outcode already listed as HMO — signals proven tenant demand.
+  Score (0-10): university proximity 30% &middot; yield 25% &middot;
+  HMO density 20% &middot; transport 15% &middot; hospital 7% &middot; affordability 3%.<br>
+  HMO density = % of houses in that outcode already listed as HMO (proven demand signal).
 </p>
 <table border="1" cellpadding="7" cellspacing="0"
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
@@ -1445,7 +1713,7 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
 
 <h3 style="margin-top:2em;">Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}</h3>
 <p style="font-size:0.85em;color:#555;">
-  Showing top 100 of {len(affordable):,} total candidates, ranked by area score then price.
+  Showing top 100 of {len(affordable):,} total, ranked by area score then price.
   &#9873; = auction listing &nbsp;|&nbsp; Score = outcode composite score
 </p>
 <table border="1" cellpadding="7" cellspacing="0"
@@ -1457,16 +1725,14 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
 </table>
 
 <p style="color:#999;margin-top:2em;font-size:0.8em;">
-  Generated by Rightmove HMO Scraper &mdash; {time.strftime('%Y-%m-%d %H:%M')} UTC<br>
-  Yield is estimated gross (room rent × beds × 12 ÷ price).
-  <b>SpareRoom</b> = live median asking rent from scraped SpareRoom listings for that outcode.
-  <b>est.</b> = regional average estimate (run the SpareRoom scraper to replace with live data).
+  Generated by Rightmove + SpareRoom HMO Scraper &mdash; {time.strftime('%Y-%m-%d %H:%M')} UTC<br>
+  Yield = gross estimate (room rent &times; beds &times; 12 &divide; price).
+  <b>SpareRoom</b> = live median asking rent. <b>est.</b> = regional average fallback.
 </p>
 </body></html>"""
 
 
 def send_hmo_email(analysis: dict) -> None:
-    """Send HMO opportunity email via Gmail SMTP (needs GMAIL_USER + GMAIL_APP_PASSWORD env vars)."""
     gmail_user = os.environ.get("GMAIL_USER", "").strip()
     gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
@@ -1476,7 +1742,7 @@ def send_hmo_email(analysis: dict) -> None:
 
     affordable = analysis["affordable"]
     if affordable.empty:
-        print("No properties under £{:,} found — skipping email.".format(HMO_PRICE_THRESHOLD))
+        print(f"No properties under £{HMO_PRICE_THRESHOLD:,} found — skipping email.")
         return
 
     msg = MIMEMultipart("alternative")
@@ -1486,9 +1752,7 @@ def send_hmo_email(analysis: dict) -> None:
     )
     msg["From"] = gmail_user
     msg["To"]   = HMO_EMAIL_TO
-
-    html = _build_email_html(affordable, analysis["hotspots"])
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(_build_email_html(affordable, analysis["hotspots"]), "html"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
@@ -1500,12 +1764,51 @@ def send_hmo_email(analysis: dict) -> None:
 
 
 # ============================================================
-# MAIN
+# POST-RUN HELPERS
 # ============================================================
 
-async def run():
-    # Clean data/ so old parquet files don't accumulate
-    for f in DATA_DIR.glob("*.parquet"):
+def clear_state():
+    empty = {"completed_outcodes": [], "collected_urls": [], "seen_urls": []}
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(empty, f, indent=2)
+    print("Rightmove state cleared.")
+
+    shards_root = DATA_DIR / "shards"
+    if shards_root.exists():
+        import shutil
+        shutil.rmtree(shards_root)
+        print("Rightmove shards directory removed.")
+
+
+def push_to_github(parquet_path: Path):
+    def run(cmd):
+        result = subprocess.run(cmd, cwd=BASE_DIR, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"git error: {result.stderr.strip()}")
+            return False
+        return True
+
+    datestamp = time.strftime("%Y-%m-%d")
+    run(["git", "config", "user.email", "scraper@rightmove-dash"])
+    run(["git", "config", "user.name",  "scraper"])
+    run(["git", "add",    str(parquet_path)])
+    committed = run(["git", "commit", "-m", f"data: scrape {datestamp}"])
+    if not committed:
+        print("Nothing to commit — parquet unchanged.")
+        return
+    if run(["git", "push"]):
+        print(f"Pushed {parquet_path.name} to GitHub.")
+    else:
+        print("Push failed — check git credentials.")
+
+
+# ============================================================
+# MAIN ENTRY POINTS
+# ============================================================
+
+async def run_rightmove():
+    """Full Rightmove scrape: URL collection + detail scraping + analysis + email."""
+    for f in DATA_DIR.glob("rightmove_*.parquet"):
         f.unlink()
 
     state = load_state()
@@ -1524,30 +1827,27 @@ async def run():
     print(f"Seen URLs          : {len(state['seen_urls']):,}")
     print(f"Pending URLs       : {len(state['collected_urls']):,}")
 
-    # ---- URL COLLECTION ----
     if remaining:
         await collect_all_urls(remaining, state)
 
     print(f"\nURL COLLECTION COMPLETE — {len(state['collected_urls']):,} pending")
 
-    # ---- DETAIL SCRAPING ----
     pending = list(state["collected_urls"] - state["seen_urls"])
     if not pending:
         print("No pending URLs to scrape.")
-        return
+        return None
 
     print(f"\nStarting detail scraping — {len(pending):,} URLs across {DETAIL_WORKERS} workers")
 
-    shard_dir = PARQUET_DIR / "shards" / time.strftime("%Y-%m-%d")
+    shard_dir = DATA_DIR / "shards" / time.strftime("%Y-%m-%d")
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    # Snapshot of state to pass into worker processes (sets aren't shared across processes)
     state_snapshot = {
         "collected_urls": list(state["collected_urls"]),
         "seen_urls":      list(state["seen_urls"]),
     }
 
-    chunks = [pending[i::DETAIL_WORKERS] for i in range(DETAIL_WORKERS)]
+    chunks   = [pending[i::DETAIL_WORKERS] for i in range(DETAIL_WORKERS)]
     result_q = Queue()
 
     writer_thread = Thread(
@@ -1570,41 +1870,51 @@ async def run():
 
     output = final_parquet_name()
     consolidate_shards(shard_dir, output)
+    return output
 
-    # ---- HMO ANALYSIS & EMAIL ----
-    if output.exists():
+
+async def run():
+    """Default: Rightmove + SpareRoom + analysis + email."""
+    output = await run_rightmove()
+
+    if not RIGHTMOVE_ONLY:
+        await run_spareroom("offered", retry_failed=RETRY_FAILED)
+        await run_spareroom("wanted",  retry_failed=RETRY_FAILED)
+
+    if output and output.exists():
         df_all   = pd.read_parquet(output)
         analysis = analyse_hmo_opportunities(df_all)
         print_metrics_report(analysis)
         send_hmo_email(analysis)
 
-    # Only clean state + push if every URL was scraped (no pending left)
+    state = load_state()
     still_pending = len(state["collected_urls"] - state["seen_urls"])
     if still_pending == 0:
         clear_state()
-        # On GitHub Actions the workflow step handles the push
         if os.environ.get("GITHUB_ACTIONS"):
             print("\nAll URLs scraped — state cleared. Workflow will push parquet.")
         else:
             print("\nAll URLs scraped — clearing state and pushing to GitHub.")
-            push_to_github(output)
+            if output:
+                push_to_github(output)
     else:
         print(f"\n{still_pending:,} URLs still pending — state kept for resume.")
 
-    print("\nALL DONE!")
-    print(f"Output : {output}")
-    print(f"Seen   : {len(state['seen_urls']):,}")
-    print(f"Pending: {still_pending:,}")
+    if output:
+        print(f"\nALL DONE!\nOutput : {output}")
 
 
 def run_analyse_only():
-    """Re-run HMO analysis on the most recent parquet without re-scraping."""
-    parquets = sorted(DATA_DIR.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+    """Re-run HMO analysis on the most recent Rightmove parquet without re-scraping."""
+    parquets = sorted(
+        DATA_DIR.glob("rightmove_*.parquet"),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
     if not parquets:
-        print("No parquet files found in data/ — run the scraper first.")
+        print("No Rightmove parquet files found in data/ — run the scraper first.")
         return
     output = parquets[0]
-    print(f"Analysing {output.name} …")
+    print(f"Analysing {output.name} ...")
     df_all   = pd.read_parquet(output)
     analysis = analyse_hmo_opportunities(df_all)
     print_metrics_report(analysis)
@@ -1612,7 +1922,7 @@ def run_analyse_only():
 
 
 async def run_retry_failed():
-    state = load_state()
+    state  = load_state()
     failed = []
     for fn in os.listdir(BASE_DIR):
         if fn.startswith("failed_urls_worker") and fn.endswith(".txt"):
@@ -1629,7 +1939,7 @@ async def run_retry_failed():
     await scrape_details(failed, "RETRY", START_CONCURRENCY, rows_buf, state)
 
     if rows_buf:
-        shard_dir = PARQUET_DIR / "shards" / time.strftime("%Y-%m-%d")
+        shard_dir = DATA_DIR / "shards" / time.strftime("%Y-%m-%d")
         shard_dir.mkdir(parents=True, exist_ok=True)
         flush_shard(rows_buf, shard_dir, 0)
         consolidate_shards(shard_dir, final_parquet_name())
@@ -1642,7 +1952,10 @@ if __name__ == "__main__":
     freeze_support()
     if ANALYSE_ONLY:
         run_analyse_only()
-    elif RETRY_FAILED:
+    elif SPAREROOM_ONLY:
+        asyncio.run(run_spareroom("offered", retry_failed=RETRY_FAILED))
+        asyncio.run(run_spareroom("wanted",  retry_failed=RETRY_FAILED))
+    elif RETRY_FAILED and not RIGHTMOVE_ONLY:
         asyncio.run(run_retry_failed())
     else:
         asyncio.run(run())
