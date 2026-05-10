@@ -67,9 +67,11 @@ jobs:
         run: python scraper_alternative.py --analyse-only
 
       - name: Push SpareRoom data to repo
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase || true
           git add data/spareroom_offered.parquet data/spareroom_wanted.parquet || true
           git diff --cached --quiet && echo "No SpareRoom data to push." && exit 0
           git commit -m "data: spareroom $(date +'%Y-%m-%d')"
