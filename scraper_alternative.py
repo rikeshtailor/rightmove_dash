@@ -2031,6 +2031,10 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
         ens_str     = str(int(ens)) if pd.notna(ens) else "-"
         monthly     = r.get("est_monthly")
         monthly_str = f"£{int(monthly):,}" if pd.notna(monthly) else "-"
+        price_n     = r.get("price_num")
+        gross_yield = (monthly * 12 / price_n * 100) if (pd.notna(monthly) and pd.notna(price_n) and price_n > 0) else None
+        yield_str   = f"{gross_yield:.1f}%" if gross_yield is not None else "-"
+        yield_col   = "#27ae60" if gross_yield and gross_yield >= 10 else ("#e67e22" if gross_yield and gross_yield >= 7 else "#c0392b")
         property_rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}{flag}</a></td>"
@@ -2040,6 +2044,7 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
             f"<td style='text-align:center'>{pot_str}</td>"
             f"<td style='text-align:center'>{ens_str}</td>"
             f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
+            f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
             f"</tr>\n"
         )
 
@@ -2081,7 +2086,7 @@ have been excluded from this report.</p>
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
   <tr style="background:#c0392b;color:#fff;">
     <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
-    <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th><th>Est. Monthly</th>
+    <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th><th>Est. Monthly</th><th>Est. Yield</th>
   </tr>
   {property_rows}
 </table>
