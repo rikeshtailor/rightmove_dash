@@ -1414,7 +1414,7 @@ def _sr_normalize(row: dict) -> dict:
         "location":     str(row.get("location") or ""),
         "room_type":    str(row.get("room_type") or ""),
         "available":    str(row.get("available") or ""),
-        "scraped_at":   pd.Timestamp.utcnow(),
+        "scraped_at":   pd.Timestamp.now("UTC"),
     }
 
 
@@ -1751,6 +1751,9 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     falling back to the regional OUTCODE_ROOM_RENTS table.
     """
     df = df.copy()
+    for _col in ("is_leasehold", "is_new_build", "is_land", "potential_hmo", "potential_auction"):
+        if _col not in df.columns:
+            df[_col] = False
     df["price_num"] = pd.to_numeric(df["price"], errors="coerce")
     df["beds_num"]  = pd.to_numeric(df["bedrooms"], errors="coerce")
     df["is_house"]  = (
