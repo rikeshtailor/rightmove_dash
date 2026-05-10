@@ -527,7 +527,9 @@ def _score_higher_better(value: float, breakpoints: list) -> int:
 
 
 def _get_room_rent(outcode: str) -> int:
-    prefix = re.match(r"^([A-Z]+)", (outcode or "").upper())
+    if not outcode or not isinstance(outcode, str):
+        return 420
+    prefix = re.match(r"^([A-Z]+)", outcode.upper())
     if not prefix:
         return 420
     key = prefix.group(1)
@@ -538,7 +540,8 @@ def _safe_float(x) -> float | None:
     if x is None:
         return None
     try:
-        return float(x)
+        v = float(x)
+        return None if v != v else v  # NaN != NaN
     except Exception:
         return None
 
@@ -1914,7 +1917,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             r["floor_sqm"],
             bathrooms=r.get("bathrooms"),
             reception_rooms=r.get("reception_rooms"),
-            has_ensuite=bool(r.get("has_ensuite")),
+            has_ensuite=bool(r.get("has_ensuite") or False),
         ),
         axis=1,
     )
