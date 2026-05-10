@@ -585,7 +585,7 @@ def _estimate_hmo_rooms(
     if floor_sqm and floor_sqm > 30:
         usable = floor_sqm * 0.65
         pot    = max(beds, min(int(usable / 10), beds + 4))
-    elif reception_rooms is not None:
+    elif reception_rooms is not None and pd.notna(reception_rooms):
         pot = beds + int(reception_rooms)
     else:
         bonus = 1 if beds <= 3 else (2 if beds == 4 else 1)
@@ -594,7 +594,7 @@ def _estimate_hmo_rooms(
     # ── En-suite capable rooms ───────────────────────────────────────────────
     if floor_sqm and floor_sqm > 30:
         ensuite = min(int(floor_sqm * 0.65 / 14), pot)
-    elif (bathrooms is not None and bathrooms >= 2) or has_ensuite:
+    elif (bathrooms is not None and pd.notna(bathrooms) and bathrooms >= 2) or has_ensuite:
         ensuite = max(1, int(pot * 0.4))   # en-suite friendly property
     else:
         ensuite = max(1, pot // 3)
