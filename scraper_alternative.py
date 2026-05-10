@@ -25,8 +25,6 @@ from multiprocessing import Process, Queue, freeze_support
 from pathlib import Path
 from math import radians, sin, cos, sqrt, atan2
 from urllib.parse import urlparse, parse_qs
-import pyarrow as pa
-import pyarrow.parquet as pq
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -48,6 +46,7 @@ except ImportError:
 # CLI FLAGS
 # ============================================================
 
+IS_CI            = bool(os.environ.get("GITHUB_ACTIONS"))
 RETRY_FAILED     = "--retry-failed"     in sys.argv
 REBUILD_FROM_ALL = "--rebuild-from-all" in sys.argv
 ANALYSE_ONLY     = "--analyse-only"     in sys.argv
@@ -763,18 +762,19 @@ async def collect_all_urls(outcodes, state):
             if done % 25 == 0:
                 save_state(state)
 
-            elapsed = time.time() - start
-            eta = (elapsed / done * total) - elapsed if done > 5 else 0
-            eta = min(max(eta, 0), 7200)
-            pct  = int(done / total * 100)
-            fill = int(30 * done / total)
-            bar  = "#" * fill + "-" * (30 - fill)
-            print(
-                f"[URLs {bar}] {pct}% ({done}/{total}) "
-                f"| PENDING={len(collected):,} "
-                f"| ETA={int(eta//60):02d}:{int(eta%60):02d}",
-                end="\r", flush=True,
-            )
+            if not IS_CI:
+                elapsed = time.time() - start
+                eta = (elapsed / done * total) - elapsed if done > 5 else 0
+                eta = min(max(eta, 0), 7200)
+                pct  = int(done / total * 100)
+                fill = int(30 * done / total)
+                bar  = "#" * fill + "-" * (30 - fill)
+                print(
+                    f"[URLs {bar}] {pct}% ({done}/{total}) "
+                    f"| PENDING={len(collected):,} "
+                    f"| ETA={int(eta//60):02d}:{int(eta%60):02d}",
+                    end="\r", flush=True,
+                )
 
             if time_is_up():
                 print("\nTime limit reached during URL collection — saving state.")
@@ -1033,7 +1033,7 @@ async def scrape_details(urls, label, concurrency, result_list, state, progress_
                         "errors":    errors,
                         "eta_secs":  int(eta),
                     })
-                else:
+                elif not IS_CI:
                     fill = int(30 * frac)
                     bar  = "#" * fill + "-" * (30 - fill)
                     print(
@@ -1125,12 +1125,12 @@ def writer_thread_func(result_queue, shard_dir, expected_done, state):
         nonlocal shard_index
         if not rows_buf:
             return
-        df    = pd.DataFrame(rows_buf)
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        out   = shard_dir / f"rightmove_part_{shard_index:05d}.parquet"
-        pq.write_table(table, out, compression=None)
-        sys.stdout.write(f"Wrote shard -> {out.name} ({len(df):,} rows)\n")
-        sys.stdout.flush()
+        df  = pd.DataFrame(rows_buf)
+        out = shard_dir / f"rightmove_part_{shard_index:05d}.parquet"
+        df.to_parquet(out, index=False, compression=None)
+        if not IS_CI:
+            sys.stdout.write(f"Wrote shard -> {out.name} ({len(df):,} rows)\n")
+            sys.stdout.flush()
         rows_buf.clear()
         shard_index += 1
 
@@ -1156,8 +1156,9 @@ def writer_thread_func(result_queue, shard_dir, expected_done, state):
                 "errors":    item["errors"],
                 "eta_secs":  item["eta_secs"],
             }
-            _render_table(workers, table_printed)
-            table_printed = True
+            if not IS_CI:
+                _render_table(workers, table_printed)
+                table_printed = True
             continue
 
         rows_buf.append(item)
@@ -1201,10 +1202,9 @@ def consolidate_shards(shard_dir, output_path):
 
 
 def flush_shard(rows, shard_dir, shard_index):
-    df    = pd.DataFrame(rows)
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    out   = shard_dir / f"rightmove_part_{shard_index:05d}.parquet"
-    pq.write_table(table, out, compression=None)
+    df  = pd.DataFrame(rows)
+    out = shard_dir / f"rightmove_part_{shard_index:05d}.parquet"
+    df.to_parquet(out, index=False, compression=None)
     print(f"\nWrote shard -> {out} ({len(df):,} rows)")
     return shard_index + 1
 
@@ -1485,7 +1485,8 @@ async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
         out = output_dir / f"spareroom_shard_{ts}.parquet"
         df.to_parquet(str(out) + ".tmp", index=False)
         os.replace(str(out) + ".tmp", out)
-        print(f"\nWrote SpareRoom shard -> {out.name} ({len(df):,} rows)")
+        if not IS_CI:
+            print(f"\nWrote SpareRoom shard -> {out.name} ({len(df):,} rows)")
         batch = []
         shard_idx += 1
 
@@ -1523,16 +1524,17 @@ async def run_spareroom(flatshare_type: str, retry_failed: bool = False):
                 total_rows += len(rows)
                 done += 1
 
-                frac = done / total
-                elapsed = time.time() - start_ts
-                eta = max(0, int((elapsed / max(frac, 1e-9)) - elapsed)) if done > 5 else 0
-                fill = int(30 * frac)
-                bar  = "#" * fill + "-" * (30 - fill)
-                print(
-                    f"[SR-{flatshare_type} {bar}] {int(frac*100)}% ({done:,}/{total:,})"
-                    f" | ETA {eta//60:02d}:{eta%60:02d}",
-                    end="\r", flush=True,
-                )
+                if not IS_CI:
+                    frac = done / total
+                    elapsed = time.time() - start_ts
+                    eta = max(0, int((elapsed / max(frac, 1e-9)) - elapsed)) if done > 5 else 0
+                    fill = int(30 * frac)
+                    bar  = "#" * fill + "-" * (30 - fill)
+                    print(
+                        f"[SR-{flatshare_type} {bar}] {int(frac*100)}% ({done:,}/{total:,})"
+                        f" | ETA {eta//60:02d}:{eta%60:02d}",
+                        end="\r", flush=True,
+                    )
 
                 if done % 25 == 0:
                     _sr_save_state(state, state_file)
