@@ -101,7 +101,8 @@ MAX_PAGES = 50
 # HMO analysis
 HMO_EMAIL_TO        = os.environ.get("HMO_EMAIL_TO", "")
 HMO_PRICE_THRESHOLD = 220_000
-_HOUSE_TYPE_PAT     = r"detach|semi|terrace|bungalow|town.house|cottage|villa|barn"
+_HOUSE_TYPE_PAT     = r"detach|semi|terrace|bungalow|town.house|cottage|\bvilla\b|barn"
+_LAND_TYPE_PAT      = r"\bland\b|plot|development\s+site"
 
 # URL collection concurrency
 URL_CONCURRENCY = 20
@@ -1730,9 +1731,17 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     )
     df["outcode"] = df["postcode"].fillna("").str.split().str[0].str.upper()
 
+    df["is_land"] = (
+        df["property_type"].fillna("")
+        .str.contains(_LAND_TYPE_PAT, case=False, regex=True)
+    )
+
     hmo_candidates = df[
         (df["beds_num"] >= 3) &
+        (df["beds_num"] <= 20) &
+        (df["price_num"] >= 5_000) &
         df["is_house"] &
+        (~df["is_land"]) &
         (~df["potential_hmo"].fillna(False))
     ].copy()
 
@@ -1888,13 +1897,18 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     ).where(affordable["price_num"] > 0)
     affordable = affordable.sort_values("est_yield_pct", ascending=False)
 
+    is_auction = affordable["potential_auction"].fillna(False).astype(bool)
+    affordable_standard = affordable[~is_auction].copy()
+    affordable_auction  = affordable[is_auction].copy()
+
     return {
-        "total":          len(df),
-        "hmo_candidates": hmo_candidates,
-        "five_plus":      five_plus,
-        "affordable":     affordable,
-        "hotspots":       hotspots,
-        "a4_excluded":    a4_excluded,
+        "total":               len(df),
+        "hmo_candidates":      hmo_candidates,
+        "five_plus":           five_plus,
+        "affordable":          affordable_standard,
+        "affordable_auction":  affordable_auction,
+        "hotspots":            hotspots,
+        "a4_excluded":         a4_excluded,
     }
 
 
@@ -1952,8 +1966,74 @@ def print_metrics_report(analysis: dict) -> None:
     print("=" * 72 + "\n")
 
 
-def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
+def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
+    rows = ""
+    for _, r in df.head(n).iterrows():
+        price       = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "-"
+        beds        = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
+        addr        = r.get("address") or "View listing"
+        ptype       = r.get("property_type") or "-"
+        pc          = r.get("postcode") or "-"
+        score       = r.get("hmo_score")
+        score_str   = f"{score:.1f}" if pd.notna(score) else "-"
+        rr          = r.get("room_rent_est")
+        rr_str      = f"£{int(rr):,}" if pd.notna(rr) else "-"
+        pot         = r.get("pot_rooms")
+        pot_str     = str(int(pot)) if pd.notna(pot) else "-"
+        ens         = r.get("ensuite_rooms")
+        ens_str     = str(int(ens)) if pd.notna(ens) else "-"
+        monthly     = r.get("est_monthly")
+        monthly_str = f"£{int(monthly):,}" if pd.notna(monthly) else "-"
+        gross_yield = r.get("est_yield_pct")
+        yield_str   = f"{gross_yield:.1f}%" if pd.notna(gross_yield) else "-"
+        yield_col   = (
+            "#27ae60" if pd.notna(gross_yield) and gross_yield >= 10 else
+            ("#e67e22" if pd.notna(gross_yield) and gross_yield >= 7 else "#c0392b")
+        )
+        rows += (
+            f"<tr>"
+            f"<td><a href='{r['url']}'>{addr}</a></td>"
+            f"<td>{pc}</td><td>{price}</td><td>{beds}</td><td>{ptype}</td>"
+            f"<td style='text-align:center'>{score_str}</td>"
+            f"<td style='text-align:center'>{rr_str}</td>"
+            f"<td style='text-align:center'>{pot_str}</td>"
+            f"<td style='text-align:center'>{ens_str}</td>"
+            f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
+            f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
+            f"</tr>\n"
+        )
+    return rows
+
+
+def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: int = 100) -> str:
+    total = len(df)
+    if total == 0:
+        return f"<h3 style='margin-top:2em;'>{heading}</h3><p>No properties.</p>"
+    note = (
+        f"Showing top {min(n, total):,} of {total:,} total, ranked by estimated gross yield.<br>"
+        "Score = outcode composite score &nbsp;|&nbsp; "
+        "<b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms. "
+        "<b>En-suite</b> = rooms estimated large enough to add a wet room. "
+        "<b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. All figures are estimates only."
+    )
+    rows = _property_table_rows(df, n)
+    return f"""
+<h3 style="margin-top:2em;">{heading}</h3>
+<p style="font-size:0.85em;color:#555;">{note}</p>
+<table border="1" cellpadding="7" cellspacing="0"
+       style="border-collapse:collapse;width:100%;font-size:0.88em;">
+  <tr style="background:{header_colour};color:#fff;">
+    <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
+    <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th>
+    <th>Est. Monthly</th><th>Est. Yield</th>
+  </tr>
+  {rows}
+</table>"""
+
+
+def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame, affordable_auction: pd.DataFrame | None = None) -> str:
     date_str = time.strftime("%d %B %Y")
+    auction_df = affordable_auction if affordable_auction is not None else pd.DataFrame()
 
     hotspot_rows = ""
     for i, row in hotspots.iterrows():
@@ -1979,49 +2059,21 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
             f"</tr>\n"
         )
 
-    property_rows = ""
-    for _, r in affordable.head(100).iterrows():
-        price       = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "-"
-        beds        = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
-        addr        = r.get("address") or "View listing"
-        ptype       = r.get("property_type") or "-"
-        pc          = r.get("postcode") or "-"
-        score       = r.get("hmo_score")
-        score_str   = f"{score:.1f}" if pd.notna(score) else "-"
-        flag        = " &#9873;" if r.get("potential_auction") else ""
-        rr          = r.get("room_rent_est")
-        rr_str      = f"£{int(rr):,}" if pd.notna(rr) else "-"
-        pot         = r.get("pot_rooms")
-        pot_str     = str(int(pot)) if pd.notna(pot) else "-"
-        ens         = r.get("ensuite_rooms")
-        ens_str     = str(int(ens)) if pd.notna(ens) else "-"
-        monthly     = r.get("est_monthly")
-        monthly_str = f"£{int(monthly):,}" if pd.notna(monthly) else "-"
-        gross_yield = r.get("est_yield_pct")
-        yield_str   = f"{gross_yield:.1f}%" if pd.notna(gross_yield) else "-"
-        yield_col   = "#27ae60" if pd.notna(gross_yield) and gross_yield >= 10 else ("#e67e22" if pd.notna(gross_yield) and gross_yield >= 7 else "#c0392b")
-        property_rows += (
-            f"<tr>"
-            f"<td><a href='{r['url']}'>{addr}{flag}</a></td>"
-            f"<td>{pc}</td><td>{price}</td><td>{beds}</td><td>{ptype}</td>"
-            f"<td style='text-align:center'>{score_str}</td>"
-            f"<td style='text-align:center'>{rr_str}</td>"
-            f"<td style='text-align:center'>{pot_str}</td>"
-            f"<td style='text-align:center'>{ens_str}</td>"
-            f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
-            f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
-            f"</tr>\n"
-        )
+    standard_table = _property_table_html(
+        affordable, f"Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}", "#c0392b"
+    )
+    auction_table = _property_table_html(
+        auction_df, f"Auction Properties Under £{HMO_PRICE_THRESHOLD:,}", "#8e44ad"
+    ) if not auction_df.empty else ""
 
     return f"""<html><body style="font-family:Arial,sans-serif;color:#222;max-width:960px;margin:auto;">
 <h2 style="color:#c0392b;border-bottom:2px solid #c0392b;padding-bottom:6px;">
   HMO Opportunity Report &mdash; {date_str}
 </h2>
-<p>HMO conversion candidates (3+ bed house, not already HMO) priced under
-<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties sorted by area score then price.
-Properties in <b>Article 4 direction areas</b> (planning permission required for HMO conversion)
-have been excluded from this report.</p>
-<p><b>{len(affordable):,} total candidates</b> — showing top 100.</p>
+<p>HMO conversion candidates (3+ bed house, not already HMO, not land) priced under
+<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties in <b>Article 4 direction areas</b>
+have been excluded. Auction properties are listed separately below.</p>
+<p><b>{len(affordable):,} standard</b> + <b>{len(auction_df):,} auction</b> candidates.</p>
 
 <h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>
 <p style="font-size:0.85em;color:#555;">
@@ -2039,22 +2091,8 @@ have been excluded from this report.</p>
   {hotspot_rows}
 </table>
 
-<h3 style="margin-top:2em;">Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}</h3>
-<p style="font-size:0.85em;color:#555;">
-  Showing top 100 of {len(affordable):,} total, ranked by estimated gross yield.
-  &#9873; = auction listing &nbsp;|&nbsp; Score = outcode composite score<br>
-  <b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms (current beds + convertible receptions).
-  <b>En-suite</b> = rooms estimated large enough to add a wet room.
-  <b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. All figures are estimates only.
-</p>
-<table border="1" cellpadding="7" cellspacing="0"
-       style="border-collapse:collapse;width:100%;font-size:0.88em;">
-  <tr style="background:#c0392b;color:#fff;">
-    <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
-    <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th><th>Est. Monthly</th><th>Est. Yield</th>
-  </tr>
-  {property_rows}
-</table>
+{standard_table}
+{auction_table}
 
 <p style="color:#999;margin-top:2em;font-size:0.8em;">
   Generated by Rightmove + SpareRoom HMO Scraper &mdash; {time.strftime('%Y-%m-%d %H:%M')} UTC<br>
@@ -2084,7 +2122,7 @@ def send_hmo_email(analysis: dict) -> None:
     )
     msg["From"] = gmail_user
     msg["To"]   = HMO_EMAIL_TO
-    msg.attach(MIMEText(_build_email_html(affordable, analysis["hotspots"]), "html"))
+    msg.attach(MIMEText(_build_email_html(affordable, analysis["hotspots"], analysis.get("affordable_auction")), "html"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
