@@ -560,34 +560,44 @@ def _parse_floor_area_sqm(fa_str) -> float | None:
     return None
 
 
-def _estimate_hmo_rooms(beds_num, floor_sqm) -> tuple[int, int]:
+def _estimate_hmo_rooms(
+    beds_num,
+    floor_sqm,
+    bathrooms=None,
+    reception_rooms=None,
+    has_ensuite: bool = False,
+) -> tuple[int, int]:
     """
     Return (potential_rooms, ensuite_capable_rooms).
 
-    Floor-area path (used when floor_sqm available):
-      - 35% of total area reserved for communal spaces (hallways, kitchen, bathrooms)
-      - Standard lettable HMO room: 10 sq m
-      - En-suite capable room: 14 sq m (10 sqm room + 4 sqm wet room)
+    Priority order for room count:
+      1. Floor area (when scraped): usable = total * 0.65, room = 10 sq m each
+      2. Known reception_rooms from keyFeatures: beds + receptions
+      3. Bedroom-count heuristic: 3-bed → +1, 4-bed → +2, 5+ → +1
 
-    Bedroom-count fallback (used when floor area not scraped):
-      - Standard UK terrace/semi has 1-2 reception rooms that can be converted
-      - En-suite: roughly 1 in 3 rooms large enough for a wet room addition
+    Priority order for en-suite estimate:
+      1. Floor area: rooms ≥ 14 sq m can take a wet room
+      2. Bathrooms ≥ 2 or existing en-suite flag → 40% of rooms en-suite capable
+      3. Default: 1 in 3 rooms
     """
     beds = int(beds_num) if pd.notna(beds_num) and beds_num > 0 else 3
 
+    # ── Potential rooms ──────────────────────────────────────────────────────
     if floor_sqm and floor_sqm > 30:
-        usable    = floor_sqm * 0.65
-        pot       = max(beds, min(int(usable / 10), beds + 4))
-        ensuite   = min(int(usable / 14), pot)
+        usable = floor_sqm * 0.65
+        pot    = max(beds, min(int(usable / 10), beds + 4))
+    elif reception_rooms is not None:
+        pot = beds + int(reception_rooms)
     else:
-        # UK layout heuristic: count convertible reception rooms
-        if beds <= 3:
-            bonus = 1       # one reception → extra room
-        elif beds == 4:
-            bonus = 2       # lounge + dining → two extra rooms
-        else:
-            bonus = 1       # already large; one reception converted
-        pot     = beds + bonus
+        bonus = 1 if beds <= 3 else (2 if beds == 4 else 1)
+        pot   = beds + bonus
+
+    # ── En-suite capable rooms ───────────────────────────────────────────────
+    if floor_sqm and floor_sqm > 30:
+        ensuite = min(int(floor_sqm * 0.65 / 14), pot)
+    elif (bathrooms is not None and bathrooms >= 2) or has_ensuite:
+        ensuite = max(1, int(pot * 0.4))   # en-suite friendly property
+    else:
         ensuite = max(1, pot // 3)
 
     return pot, ensuite
@@ -778,41 +788,102 @@ async def collect_all_urls(outcodes, state):
 # RIGHTMOVE DETAIL SCRAPER
 # ============================================================
 
-def extract_page_model(html: str):
-    key = "window.PAGE_MODEL"
-    pos = html.find(key)
-    if pos == -1:
-        return None
-    eq = html.find("=", pos)
-    if eq == -1:
-        return None
-    start = html.find("{", eq)
+def _extract_json_object(html: str, pos: int) -> dict | None:
+    """Extract the JSON object starting at the first '{' after pos."""
+    start = html.find("{", pos)
     if start == -1:
         return None
-
     depth, in_str, esc = 0, False, False
-    for i in range(start, len(html)):
+    for i in range(start, min(start + 400_000, len(html))):
         ch = html[i]
         if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
+            if esc:   esc = False
+            elif ch == "\\": esc = True
+            elif ch == '"':  in_str = False
             continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
+        if   ch == '"': in_str = True
+        elif ch == "{": depth += 1
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                try:
-                    return json.loads(html[start:i+1])
-                except Exception:
-                    return None
+                try:    return json.loads(html[start:i + 1])
+                except: return None
     return None
+
+
+def _decode_rightmove_compressed(outer: dict) -> dict | None:
+    """
+    Decode Rightmove's indexed-array JSON compression (window.__PAGE_MODEL).
+    The outer object has a 'data' key whose value is a JSON-encoded array.
+    Array[0] is the root template; integer values are indices into the array.
+    Primitives stored at those indices are returned as-is; complex types recurse.
+    """
+    data_str = outer.get("data")
+    if not isinstance(data_str, str):
+        return None
+    try:
+        arr = json.loads(data_str)
+    except Exception:
+        return None
+
+    def resolve(val, depth=0):
+        if depth > 40:
+            return val
+        if isinstance(val, int) and 0 < val < len(arr):
+            inner = arr[val]
+            return resolve(inner, depth + 1) if isinstance(inner, (dict, list)) else inner
+        if isinstance(val, dict):
+            return {k: resolve(v, depth + 1) for k, v in val.items()}
+        if isinstance(val, list):
+            return [resolve(v, depth + 1) for v in val]
+        return val
+
+    try:
+        return resolve(arr[0])
+    except Exception:
+        return None
+
+
+def extract_page_model(html: str) -> dict | None:
+    """
+    Extract and decode the Rightmove page model.
+    Supports both the old window.PAGE_MODEL and the new window.__PAGE_MODEL
+    compressed-array format.
+    """
+    for key in ("window.__PAGE_MODEL", "window.PAGE_MODEL"):
+        pos = html.find(key)
+        if pos == -1:
+            continue
+        outer = _extract_json_object(html, pos)
+        if not outer:
+            continue
+        # New compressed format
+        if "data" in outer and isinstance(outer.get("data"), str):
+            decoded = _decode_rightmove_compressed(outer)
+            if decoded:
+                return decoded
+        # Old flat format
+        if "propertyData" in outer or "analyticsInfo" in outer:
+            return outer
+    return None
+
+
+_RECEPTION_RE = re.compile(r'(\d+)\s+reception', re.IGNORECASE)
+_ENSUITE_RE   = re.compile(r'en.?suite', re.IGNORECASE)
+
+
+def _parse_key_features(features) -> tuple[int | None, bool]:
+    """
+    Parse Rightmove keyFeatures list.
+    Returns (reception_rooms, has_ensuite).
+    reception_rooms is None when not mentioned explicitly.
+    """
+    if not features:
+        return None, False
+    text = " ".join(str(f) for f in features)
+    m = _RECEPTION_RE.search(text)
+    receptions = int(m.group(1)) if m else None
+    return receptions, bool(_ENSUITE_RE.search(text))
 
 
 def normalize_row(url, model, status, description_text=""):
@@ -820,15 +891,18 @@ def normalize_row(url, model, status, description_text=""):
     potential_auction = bool(AUCTION_RE.search(desc))
     potential_hmo     = bool(HMO_RE.search(desc))
 
+    _null = {
+        "url": url, "address": None, "postcode": None,
+        "price": None, "bedrooms": None, "bathrooms": None,
+        "reception_rooms": None, "has_ensuite": False,
+        "property_type": None, "floor_area": None,
+        "latitude": None, "longitude": None,
+        "status": int(status) if str(status).isdigit() else None,
+        "potential_auction": potential_auction,
+        "potential_hmo": potential_hmo,
+    }
     if not model:
-        return {
-            "url": url, "address": None, "postcode": None,
-            "price": None, "bedrooms": None, "property_type": None,
-            "floor_area": None, "latitude": None, "longitude": None,
-            "status": int(status) if str(status).isdigit() else None,
-            "potential_auction": potential_auction,
-            "potential_hmo": potential_hmo,
-        }
+        return _null
 
     prop      = model.get("propertyData", {}) or {}
     analytics = (model.get("analyticsInfo", {}) or {}).get("analyticsProperty", {}) or {}
@@ -853,12 +927,17 @@ def normalize_row(url, model, status, description_text=""):
         lat = analytics.get("latitude") or analytics.get("lat") or lat
         lon = analytics.get("longitude") or analytics.get("lng") or lon
 
+    reception_rooms, has_ensuite = _parse_key_features(prop.get("keyFeatures"))
+
     return {
         "url":               url,
         "address":           addr.get("displayAddress"),
         "postcode":          analytics.get("postcode") or f"{outcode} {incode}".strip(),
         "price":             analytics.get("price"),
         "bedrooms":          prop.get("bedrooms"),
+        "bathrooms":         prop.get("bathrooms"),
+        "reception_rooms":   reception_rooms,
+        "has_ensuite":       has_ensuite,
         "property_type":     prop.get("propertySubType") or prop.get("propertyType"),
         "floor_area":        fa,
         "latitude":          lat,
@@ -1828,7 +1907,14 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     )
     affordable["floor_sqm"] = affordable["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_est = affordable.apply(
-        lambda r: _estimate_hmo_rooms(r["beds_num"], r["floor_sqm"]), axis=1
+        lambda r: _estimate_hmo_rooms(
+            r["beds_num"],
+            r["floor_sqm"],
+            bathrooms=r.get("bathrooms"),
+            reception_rooms=r.get("reception_rooms"),
+            has_ensuite=bool(r.get("has_ensuite")),
+        ),
+        axis=1,
     )
     affordable["pot_rooms"]     = _hmo_est.apply(lambda x: x[0])
     affordable["ensuite_rooms"] = _hmo_est.apply(lambda x: x[1])
