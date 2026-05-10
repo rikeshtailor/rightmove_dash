@@ -3,6 +3,10 @@ name: Rightmove Scraper
 on:
   workflow_dispatch:
     inputs:
+      analyse_only:
+        description: "Analyse existing parquet and send HMO email (no scraping)"
+        type: boolean
+        default: false
       retry_failed:
         description: "Retry previously failed URLs"
         type: boolean
@@ -41,12 +45,17 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
         run: |
-          ARGS="--time-limit 130"
-          if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
-          if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
-          python scraper_alternative.py $ARGS
+          if [ "${{ inputs.analyse_only }}" = "true" ]; then
+            python scraper_alternative.py --analyse-only
+          else
+            ARGS="--time-limit 130"
+            if [ "${{ inputs.retry_failed }}" = "true" ]; then ARGS="$ARGS --retry-failed"; fi
+            if [ "${{ inputs.rebuild_from_all }}" = "true" ]; then ARGS="$ARGS --rebuild-from-all"; fi
+            python scraper_alternative.py $ARGS
+          fi
 
       - name: Push parquet to repo
+        if: ${{ inputs.analyse_only != true }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
