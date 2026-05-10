@@ -1,1 +1,4 @@
 parquet/
+data/shards/
+data/spareroom_offered/
+data/spareroom_wanted/
