@@ -1097,6 +1097,70 @@ def push_to_github(parquet_path: Path):
 # HMO ANALYSIS & EMAIL
 # ============================================================
 
+def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
+    """
+    Read SpareRoom offered-room parquet shards from offered/ and return
+    outcode → median monthly rent (£).  Outcodes with fewer than
+    min_listings are excluded so thin samples don't distort the yield calc.
+    Returns an empty dict if no SpareRoom data has been scraped yet,
+    in which case the static OUTCODE_ROOM_RENTS table is used as fallback.
+    """
+    offered_dir = BASE_DIR / "offered"
+    shards = sorted(offered_dir.glob("spareroom_shard_*.parquet")) if offered_dir.exists() else []
+    if not shards:
+        return {}
+
+    dfs = []
+    for f in shards:
+        try:
+            dfs.append(pd.read_parquet(f, columns=["postcode", "pcm_price", "pw_price"]))
+        except Exception:
+            pass
+    if not dfs:
+        return {}
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    def _to_monthly(pcm_str, pw_str) -> float | None:
+        def _clean(s):
+            if not s or str(s).strip() in ("", "None", "nan"):
+                return None
+            return re.sub(r"[£,\s]", "", str(s))
+
+        pcm = _clean(pcm_str)
+        if pcm:
+            try:
+                v = float(pcm)
+                if 50 < v < 5_000:
+                    return v
+            except ValueError:
+                pass
+
+        pw = _clean(pw_str)
+        if pw:
+            try:
+                v = float(pw)
+                if 10 < v < 1_500:
+                    return round(v * 52 / 12, 2)
+            except ValueError:
+                pass
+        return None
+
+    df["monthly_rent"] = df.apply(
+        lambda r: _to_monthly(r["pcm_price"], r["pw_price"]), axis=1
+    )
+    df = df.dropna(subset=["monthly_rent"])
+    df["outcode"] = df["postcode"].fillna("").str.split().str[0].str.upper()
+    df = df[df["outcode"].notna() & (df["outcode"] != "")]
+
+    rents: dict[str, float] = {}
+    for oc, grp in df.groupby("outcode"):
+        if len(grp) >= min_listings:
+            rents[oc] = round(grp["monthly_rent"].median(), 0)
+
+    return rents
+
+
 def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     """
     Identify HMO conversion candidates and score outcode hotspots.
@@ -1129,6 +1193,9 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     ].copy()
 
     five_plus = df[df["beds_num"] >= 5].copy()
+
+    # ── SpareRoom live rent data (outcode → median £/month) ───────────────────
+    spareroom_rents = load_spareroom_rents()
 
     # ── Per-outcode stats ─────────────────────────────────────────────────────
     all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
@@ -1166,7 +1233,12 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         lat, lon = centroids.loc[oc, "lat"], centroids.loc[oc, "lon"]
         med_price = row["median_price"]
         avg_beds  = row["avg_beds"]
-        room_rent = _get_room_rent(oc)
+        if oc in spareroom_rents:
+            room_rent   = spareroom_rents[oc]
+            rent_source = "spareroom"
+        else:
+            room_rent   = _get_room_rent(oc)
+            rent_source = "regional"
         density   = hmo_density.get(oc, 0.0)
 
         # Gross yield estimate: (annual room income) / purchase price × 100
@@ -1196,22 +1268,24 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         )
 
         rows.append({
-            "outcode":       oc,
-            "opportunities": int(row["opportunities"]),
-            "median_price":  med_price,
-            "avg_beds":      avg_beds,
-            "under_220k":    int(row["under_220k"]),
-            "hmo_density":   round(density, 1),
-            "est_yield":     round(est_yield, 1),
-            "dist_uni_km":   round(dist_uni, 1),
-            "dist_hosp_km":  round(dist_hosp, 1),
-            "dist_sta_km":   round(dist_sta, 1),
-            "score_uni":     s_uni,
-            "score_hosp":    s_hosp,
+            "outcode":         oc,
+            "opportunities":   int(row["opportunities"]),
+            "median_price":    med_price,
+            "avg_beds":        avg_beds,
+            "under_220k":      int(row["under_220k"]),
+            "hmo_density":     round(density, 1),
+            "room_rent":       int(room_rent),
+            "rent_source":     rent_source,
+            "est_yield":       round(est_yield, 1),
+            "dist_uni_km":     round(dist_uni, 1),
+            "dist_hosp_km":    round(dist_hosp, 1),
+            "dist_sta_km":     round(dist_sta, 1),
+            "score_uni":       s_uni,
+            "score_hosp":      s_hosp,
             "score_transport": s_sta,
-            "score_yield":   s_yield,
-            "score_density": s_dens,
-            "score_afford":  s_afford,
+            "score_yield":     s_yield,
+            "score_density":   s_dens,
+            "score_afford":    s_afford,
             "composite_score": round(composite, 2),
         })
 
@@ -1268,20 +1342,26 @@ def print_metrics_report(analysis: dict) -> None:
         print(f"    Max     : £{p.max():>10,.0f}")
 
     if len(hot) > 0:
+        sr_count = (hot["rent_source"] == "spareroom").sum() if "rent_source" in hot.columns else 0
+        total_oc = len(hot)
+        print(f"\n  Rent data: {sr_count}/{total_oc} hotspot outcodes use live SpareRoom data"
+              f" ({total_oc - sr_count} use regional fallback)")
         print(f"\n  TOP HMO HOTSPOTS  (ranked by composite investment score)")
         hdr = (
             f"  {'#':<3}  {'Area':<7}  {'Score':>5}  {'Count':>5}  "
-            f"{'Median':>9}  {'Yield':>5}  {'HMO%':>4}  "
+            f"{'Median':>9}  {'Rent/rm':>7}  {'Src':<3}  {'Yield':>5}  {'HMO%':>4}  "
             f"{'Uni km':>6}  {'Sta km':>6}  {'<220k':>5}"
         )
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         for _, row in hot.iterrows():
             med = f"£{row['median_price']:,.0f}" if pd.notna(row["median_price"]) else "N/A"
+            src = "SR" if row.get("rent_source") == "spareroom" else "est"
             print(
                 f"  {_+1:<3}  {row['outcode']:<7}  {row['composite_score']:>5.2f}"
                 f"  {row['opportunities']:>5,}  {med:>9}"
-                f"  {row['est_yield']:>4.1f}%  {row['hmo_density']:>4.1f}%"
+                f"  £{row['room_rent']:>5,}  {src:<3}  {row['est_yield']:>4.1f}%"
+                f"  {row['hmo_density']:>4.1f}%"
                 f"  {row['dist_uni_km']:>6.1f}  {row['dist_sta_km']:>6.1f}"
                 f"  {row['under_220k']:>5,}"
             )
@@ -1298,6 +1378,13 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
         # Colour-code score: green ≥7, amber ≥4, red <4
         sc     = int(score * 10)
         colour = "#27ae60" if score >= 7 else ("#e67e22" if score >= 4 else "#c0392b")
+        src_badge = (
+            "<span style='background:#27ae60;color:#fff;padding:1px 5px;border-radius:3px;"
+            "font-size:0.8em'>SpareRoom</span>"
+            if row.get("rent_source") == "spareroom" else
+            "<span style='background:#95a5a6;color:#fff;padding:1px 5px;border-radius:3px;"
+            "font-size:0.8em'>est.</span>"
+        )
         hotspot_rows += (
             f"<tr>"
             f"<td>{i+1}</td>"
@@ -1305,6 +1392,7 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
             f"<td style='color:{colour};font-weight:bold'>{score:.2f}</td>"
             f"<td>{int(row['opportunities']):,}</td>"
             f"<td>{med}</td>"
+            f"<td>£{int(row['room_rent']):,}/mo {src_badge}</td>"
             f"<td>{row['est_yield']:.1f}%</td>"
             f"<td>{row['hmo_density']:.1f}%</td>"
             f"<td>{row['dist_uni_km']:.1f} km</td>"
@@ -1349,7 +1437,7 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
   <tr style="background:#2c3e50;color:#fff;">
     <th>#</th><th>Area</th><th>Score</th><th>Listings</th>
-    <th>Median Price</th><th>Est. Yield</th><th>HMO Density</th>
+    <th>Median Price</th><th>Room Rent</th><th>Est. Yield</th><th>HMO Density</th>
     <th>Uni Dist</th><th>Station Dist</th><th>Under £220k</th>
   </tr>
   {hotspot_rows}
@@ -1370,7 +1458,9 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame) -> str:
 
 <p style="color:#999;margin-top:2em;font-size:0.8em;">
   Generated by Rightmove HMO Scraper &mdash; {time.strftime('%Y-%m-%d %H:%M')} UTC<br>
-  Yield is estimated gross (room rent × beds × 12 ÷ price). Room rents are regional averages.
+  Yield is estimated gross (room rent × beds × 12 ÷ price).
+  <b>SpareRoom</b> = live median asking rent from scraped SpareRoom listings for that outcode.
+  <b>est.</b> = regional average estimate (run the SpareRoom scraper to replace with live data).
 </p>
 </body></html>"""
 
