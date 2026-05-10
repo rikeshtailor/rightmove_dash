@@ -1803,6 +1803,23 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
 
     spareroom_rents = load_spareroom_rents()
 
+    # Regional SpareRoom average: median of all outcodes sharing the same letter prefix
+    # Used as fallback when specific outcode has insufficient listings
+    sr_region_rents: dict[str, float] = {}
+    for oc, rent in spareroom_rents.items():
+        prefix = re.match(r"^([A-Z]+)", oc)
+        if prefix:
+            sr_region_rents.setdefault(prefix.group(1), []).append(rent)  # type: ignore[arg-type]
+    sr_region_rents = {k: float(pd.Series(v).median()) for k, v in sr_region_rents.items()}  # type: ignore[assignment]
+
+    def _room_rent(outcode: str) -> int:
+        if outcode in spareroom_rents:
+            return int(spareroom_rents[outcode])
+        prefix = re.match(r"^([A-Z]+)", outcode) if outcode else None
+        if prefix and prefix.group(1) in sr_region_rents:
+            return int(sr_region_rents[prefix.group(1)])
+        return _get_room_rent(outcode)
+
     all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
 
     centroids = (
@@ -1840,7 +1857,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             room_rent   = spareroom_rents[oc]
             rent_source = "spareroom"
         else:
-            room_rent   = _get_room_rent(oc)
+            room_rent   = _room_rent(oc)
             rent_source = "regional"
 
         density = hmo_density.get(oc, 0.0)
@@ -1905,9 +1922,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable = affordable.sort_values(["hmo_score", "price_num"], ascending=[False, True])
 
     # Per-property HMO income estimates
-    affordable["room_rent_est"] = affordable["outcode"].apply(
-        lambda oc: int(spareroom_rents.get(oc, _get_room_rent(oc)))
-    )
+    affordable["room_rent_est"] = affordable["outcode"].apply(_room_rent)
     affordable["floor_sqm"] = affordable["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_est = affordable.apply(
         lambda r: _estimate_hmo_rooms(
@@ -1926,6 +1941,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         affordable["est_monthly"] * 12 / affordable["price_num"] * 100
     ).where(affordable["price_num"] > 0)
     affordable = affordable.sort_values("est_yield_pct", ascending=False)
+    affordable = affordable[affordable["est_yield_pct"].fillna(0) <= 35].copy()
 
     is_auction = affordable["potential_auction"].fillna(False).astype(bool)
     affordable_standard = affordable[~is_auction].copy()
