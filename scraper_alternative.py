@@ -91,7 +91,7 @@ OUTCODE_CSV = os.environ.get(
 SPAREROOM_CSV = (
     _sr_csv_arg
     or os.environ.get("SPAREROOM_CSV", "")
-    or r"C:\rightmove_monitor\spareroom\postcodes.csv"
+    or str(BASE_DIR / "postcodes.csv")
 )
 
 PAGE_SIZE = 24
