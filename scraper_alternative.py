@@ -2175,15 +2175,17 @@ def send_hmo_email(analysis: dict) -> None:
         f"HMO Opportunities Under £{HMO_PRICE_THRESHOLD:,} "
         f"({len(affordable):,} properties) — {time.strftime('%d %b %Y')}"
     )
+    recipients = [a.strip() for a in HMO_EMAIL_TO.split(",") if a.strip()]
+
+    msg["To"] = ", ".join(recipients)
     msg["From"] = gmail_user
-    msg["To"]   = HMO_EMAIL_TO
     msg.attach(MIMEText(_build_email_html(affordable, analysis["hotspots"], analysis.get("affordable_auction")), "html"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(gmail_user, gmail_pass)
-            smtp.sendmail(gmail_user, HMO_EMAIL_TO, msg.as_string())
-        print(f"HMO email sent to {HMO_EMAIL_TO} — {len(affordable):,} properties listed.")
+            smtp.sendmail(gmail_user, recipients, msg.as_string())
+        print(f"HMO email sent to {recipients} — {len(affordable):,} properties listed.")
     except Exception as exc:
         print(f"Email send failed: {exc}")
 
