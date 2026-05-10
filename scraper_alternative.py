@@ -1705,7 +1705,7 @@ def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
         if pcm:
             try:
                 v = float(pcm)
-                if 50 < v < 5_000:
+                if 50 < v < 1_200:   # realistic room rent ceiling (central London peak)
                     return v
             except ValueError:
                 pass
@@ -1714,7 +1714,7 @@ def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
         if pw:
             try:
                 v = float(pw)
-                if 10 < v < 1_500:
+                if 10 < v < 350:     # max £350/week per room ≈ £1,517/month
                     return round(v * 52 / 12, 2)
             except ValueError:
                 pass
@@ -1813,12 +1813,18 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     sr_region_rents = {k: float(pd.Series(v).median()) for k, v in sr_region_rents.items()}  # type: ignore[assignment]
 
     def _room_rent(outcode: str) -> int:
+        regional = _get_room_rent(outcode)
         if outcode in spareroom_rents:
-            return int(spareroom_rents[outcode])
-        prefix = re.match(r"^([A-Z]+)", outcode) if outcode else None
-        if prefix and prefix.group(1) in sr_region_rents:
-            return int(sr_region_rents[prefix.group(1)])
-        return _get_room_rent(outcode)
+            raw = int(spareroom_rents[outcode])
+        else:
+            prefix = re.match(r"^([A-Z]+)", outcode) if outcode else None
+            if prefix and prefix.group(1) in sr_region_rents:
+                raw = int(sr_region_rents[prefix.group(1)])
+            else:
+                return regional
+        # Sanity cap: SpareRoom value must not exceed 2.5x regional estimate
+        # Guards against whole-flat listings skewing outcode medians
+        return min(raw, max(regional * 2, 800))
 
     all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
 
