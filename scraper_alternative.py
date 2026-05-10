@@ -1471,12 +1471,18 @@ def build_article4_index(df: pd.DataFrame):
     if df.empty:
         return None, []
 
+    from shapely import wkt as _shapely_wkt
+
     geoms: list = []
     for geom_json in df["geometry_json"].dropna():
         try:
-            geom_dict = json.loads(geom_json)
-            if geom_dict:
-                geoms.append(shape(geom_dict))
+            parsed = json.loads(geom_json)
+            if isinstance(parsed, str):
+                # WKT string (planning.data.gov.uk returns WKT, not GeoJSON)
+                geoms.append(_shapely_wkt.loads(parsed))
+            elif isinstance(parsed, dict) and parsed:
+                # GeoJSON object
+                geoms.append(shape(parsed))
         except Exception:
             pass
 
