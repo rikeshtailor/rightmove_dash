@@ -491,12 +491,9 @@ _AFFORD_BP = [
 ]
 
 _SCORE_WEIGHTS = {
-    "university":    0.30,
-    "yield":         0.25,
-    "hmo_density":   0.20,
-    "transport":     0.15,
-    "hospital":      0.07,
-    "affordability": 0.03,
+    "yield":         0.50,
+    "hmo_density":   0.35,
+    "affordability": 0.15,
 }
 
 
@@ -1831,11 +1828,6 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
 
     all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
 
-    centroids = (
-        all_houses.dropna(subset=["latitude", "longitude"])
-        .groupby("outcode")
-        .agg(lat=("latitude", "mean"), lon=("longitude", "mean"))
-    )
 
     hmo_counts   = all_houses[all_houses["potential_hmo"].fillna(False)].groupby("outcode").size()
     house_counts = all_houses.groupby("outcode").size()
@@ -1856,9 +1848,6 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
 
     rows = []
     for oc, row in agg.iterrows():
-        if oc not in centroids.index:
-            continue
-        lat, lon  = centroids.loc[oc, "lat"], centroids.loc[oc, "lon"]
         med_price = row["median_price"]
         avg_beds  = row["avg_beds"]
 
@@ -1876,23 +1865,13 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             if pd.notna(med_price) and med_price > 0 else 0.0
         )
 
-        dist_uni  = _nearest_km(lat, lon, UK_UNIVERSITIES)
-        dist_hosp = _nearest_km(lat, lon, UK_HOSPITALS)
-        dist_sta  = _nearest_km(lat, lon, UK_STATIONS)
-
-        s_uni    = _score_lower_better(dist_uni,              _UNI_BP)
-        s_hosp   = _score_lower_better(dist_hosp,             _HOSP_BP)
-        s_sta    = _score_lower_better(dist_sta,              _STA_BP)
         s_yield  = _score_higher_better(est_yield,            _YIELD_BP)
         s_dens   = _score_higher_better(density,              _DENS_BP)
         s_afford = _score_lower_better(med_price or 999_999,  _AFFORD_BP)
 
         composite = (
-            s_uni    * _SCORE_WEIGHTS["university"]
-            + s_yield  * _SCORE_WEIGHTS["yield"]
+            s_yield  * _SCORE_WEIGHTS["yield"]
             + s_dens   * _SCORE_WEIGHTS["hmo_density"]
-            + s_sta    * _SCORE_WEIGHTS["transport"]
-            + s_hosp   * _SCORE_WEIGHTS["hospital"]
             + s_afford * _SCORE_WEIGHTS["affordability"]
         )
 
@@ -1906,12 +1885,6 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             "room_rent":       int(room_rent),
             "rent_source":     rent_source,
             "est_yield":       round(est_yield, 1),
-            "dist_uni_km":     round(dist_uni, 1),
-            "dist_hosp_km":    round(dist_hosp, 1),
-            "dist_sta_km":     round(dist_sta, 1),
-            "score_uni":       s_uni,
-            "score_hosp":      s_hosp,
-            "score_transport": s_sta,
             "score_yield":     s_yield,
             "score_density":   s_dens,
             "score_afford":    s_afford,
@@ -1951,6 +1924,19 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     ).where(affordable["price_num"] > 0)
     affordable = affordable.sort_values("est_yield_pct", ascending=False)
     affordable = affordable[affordable["est_yield_pct"].fillna(0) <= 35].copy()
+
+    # Per-property distances using each property's actual lat/lon
+    def _prop_dists(r):
+        lat, lon = _safe_float(r.get("latitude")), _safe_float(r.get("longitude"))
+        if lat is None or lon is None:
+            return pd.Series({"dist_uni_km": None, "dist_sta_km": None, "dist_hosp_km": None})
+        return pd.Series({
+            "dist_uni_km":  round(_nearest_km(lat, lon, UK_UNIVERSITIES), 1),
+            "dist_sta_km":  round(_nearest_km(lat, lon, UK_STATIONS), 1),
+            "dist_hosp_km": round(_nearest_km(lat, lon, UK_HOSPITALS), 1),
+        })
+
+    affordable[["dist_uni_km", "dist_sta_km", "dist_hosp_km"]] = affordable.apply(_prop_dists, axis=1)
 
     is_auction = affordable["potential_auction"].fillna(False).astype(bool)
     affordable_standard = affordable[~is_auction].copy()
@@ -2015,7 +2001,6 @@ def print_metrics_report(analysis: dict) -> None:
                 f"  {row['opportunities']:>5,}  {med:>9}"
                 f"  £{row['room_rent']:>5,}  {src:<3}  {row['est_yield']:>4.1f}%"
                 f"  {row['hmo_density']:>4.1f}%"
-                f"  {row['dist_uni_km']:>6.1f}  {row['dist_sta_km']:>6.1f}"
                 f"  {row['under_220k']:>5,}"
             )
     print("=" * 72 + "\n")
@@ -2045,6 +2030,10 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
             "#27ae60" if pd.notna(gross_yield) and gross_yield >= 10 else
             ("#e67e22" if pd.notna(gross_yield) and gross_yield >= 7 else "#c0392b")
         )
+        uni_km   = r.get("dist_uni_km")
+        sta_km   = r.get("dist_sta_km")
+        uni_str  = f"{uni_km:.1f} km" if pd.notna(uni_km) else "-"
+        sta_str  = f"{sta_km:.1f} km" if pd.notna(sta_km) else "-"
         rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}</a></td>"
@@ -2055,6 +2044,8 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
             f"<td style='text-align:center'>{ens_str}</td>"
             f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
             f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
+            f"<td style='text-align:center'>{uni_str}</td>"
+            f"<td style='text-align:center'>{sta_str}</td>"
             f"</tr>\n"
         )
     return rows
@@ -2080,7 +2071,7 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
   <tr style="background:{header_colour};color:#fff;">
     <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
     <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th>
-    <th>Est. Monthly</th><th>Est. Yield</th>
+    <th>Est. Monthly</th><th>Est. Yield</th><th>Uni</th><th>Station</th>
   </tr>
   {rows}
 </table>"""
@@ -2109,7 +2100,6 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame, affordab
             f"<td>{int(row['opportunities']):,}</td><td>{med}</td>"
             f"<td>£{int(row['room_rent']):,}/mo {src_badge}</td>"
             f"<td>{row['est_yield']:.1f}%</td><td>{row['hmo_density']:.1f}%</td>"
-            f"<td>{row['dist_uni_km']:.1f} km</td><td>{row['dist_sta_km']:.1f} km</td>"
             f"<td>{int(row['under_220k']):,}</td>"
             f"</tr>\n"
         )
@@ -2141,7 +2131,7 @@ have been excluded. Auction properties are listed separately below.</p>
   <tr style="background:#2c3e50;color:#fff;">
     <th>#</th><th>Area</th><th>Score</th><th>Listings</th>
     <th>Median Price</th><th>Room Rent</th><th>Est. Yield</th><th>HMO Density</th>
-    <th>Uni Dist</th><th>Station Dist</th><th>Under £220k</th>
+    <th>Under £220k</th>
   </tr>
   {hotspot_rows}
 </table>
