@@ -2122,9 +2122,10 @@ have been excluded. Auction properties are listed separately below.</p>
 
 <h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>
 <p style="font-size:0.85em;color:#555;">
-  Score (0-10): university proximity 30% &middot; yield 25% &middot;
-  HMO density 20% &middot; transport 15% &middot; hospital 7% &middot; affordability 3%.<br>
-  HMO density = % of houses in that outcode already listed as HMO (proven demand signal).
+  <b>Score (0-10)</b> weighted composite: estimated gross yield 50% &middot; HMO density 35% &middot; affordability 15%.<br>
+  <b>HMO Density</b> = percentage of house listings in that outcode whose description mentions &ldquo;HMO&rdquo; &mdash;
+  a proxy for proven local demand and planning acceptance, based on active Rightmove listings at scrape time.<br>
+  <b>Est. Yield</b> = (median room rent &times; median beds &times; 12) &divide; median price &mdash; gross estimate only.
 </p>
 <table border="1" cellpadding="7" cellspacing="0"
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
