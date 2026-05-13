@@ -18,6 +18,7 @@ import random
 import asyncio
 import aiohttp
 import subprocess
+import numpy as np
 import pandas as pd
 import threading
 from threading import Thread
@@ -511,6 +512,36 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _nearest_km(lat: float, lon: float, pois: list) -> float:
     return min(haversine_km(lat, lon, p[1], p[2]) for p in pois)
+
+
+def _nearest_km_vec(lats: np.ndarray, lons: np.ndarray, pois: list) -> np.ndarray:
+    """Vectorized haversine nearest distance. Returns shape-(n,) array in km."""
+    R = 6371.0
+    lat1 = np.radians(lats[:, None])
+    lon1 = np.radians(lons[:, None])
+    lat2 = np.radians(np.array([p[1] for p in pois], dtype=float))[None, :]
+    lon2 = np.radians(np.array([p[2] for p in pois], dtype=float))[None, :]
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return (R * c).min(axis=1)
+
+
+def _add_distance_cols(df: pd.DataFrame) -> None:
+    """Add dist_uni_km, dist_sta_km, dist_hosp_km in-place using vectorized haversine."""
+    lats = pd.to_numeric(df["latitude"],  errors="coerce").to_numpy(dtype=float)
+    lons = pd.to_numeric(df["longitude"], errors="coerce").to_numpy(dtype=float)
+    valid = ~(np.isnan(lats) | np.isnan(lons))
+    for col, pois in [
+        ("dist_uni_km",  UK_UNIVERSITIES),
+        ("dist_sta_km",  UK_STATIONS),
+        ("dist_hosp_km", UK_HOSPITALS),
+    ]:
+        arr = np.full(len(df), np.nan)
+        if valid.any():
+            arr[valid] = _nearest_km_vec(lats[valid], lons[valid], pois)
+        df[col] = np.round(arr, 1)
 
 
 def _score_lower_better(value: float, breakpoints: list) -> int:
@@ -1891,6 +1922,8 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             "composite_score": round(composite, 2),
         })
 
+    full_score_map = {r["outcode"]: r["composite_score"] for r in rows}
+
     hotspots = (
         pd.DataFrame(rows)
         .sort_values("composite_score", ascending=False)
@@ -1898,7 +1931,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         .reset_index(drop=True)
     )
 
-    score_map = hotspots.set_index("outcode")["composite_score"].to_dict()
+    score_map = full_score_map
     affordable = hmo_candidates[hmo_candidates["price_num"] < HMO_PRICE_THRESHOLD].copy()
     affordable["hmo_score"] = affordable["outcode"].map(score_map)
     affordable = affordable.sort_values(["hmo_score", "price_num"], ascending=[False, True])
@@ -1924,18 +1957,8 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     ).where(affordable["price_num"] > 0)
     affordable = affordable[affordable["est_yield_pct"].fillna(0) <= 35].copy()
 
-    # Per-property distances using each property's actual lat/lon
-    def _prop_dists(r):
-        lat, lon = _safe_float(r.get("latitude")), _safe_float(r.get("longitude"))
-        if lat is None or lon is None:
-            return pd.Series({"dist_uni_km": None, "dist_sta_km": None, "dist_hosp_km": None})
-        return pd.Series({
-            "dist_uni_km":  round(_nearest_km(lat, lon, UK_UNIVERSITIES), 1),
-            "dist_sta_km":  round(_nearest_km(lat, lon, UK_STATIONS), 1),
-            "dist_hosp_km": round(_nearest_km(lat, lon, UK_HOSPITALS), 1),
-        })
-
-    affordable[["dist_uni_km", "dist_sta_km", "dist_hosp_km"]] = affordable.apply(_prop_dists, axis=1)
+    # Per-property distances using vectorized haversine
+    _add_distance_cols(affordable)
 
     def _norm(s: pd.Series, higher_better: bool) -> pd.Series:
         lo, hi = s.min(), s.max()
@@ -1952,6 +1975,33 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     is_auction = affordable["potential_auction"].fillna(False).astype(bool)
     affordable_standard = affordable[~is_auction].copy()
     affordable_auction  = affordable[is_auction].copy()
+    near_station = affordable_standard[affordable_standard["dist_sta_km"].fillna(999) < 2].copy()
+
+    # ── Enrich complete dataset with same derived fields ──────────────────────
+    print("Building enriched dataset …")
+    enriched = df.copy()
+    enriched["room_rent_est"] = enriched["outcode"].apply(
+        lambda oc: _room_rent(str(oc)) if pd.notna(oc) and str(oc).strip() else None
+    )
+    enriched["hmo_score"] = enriched["outcode"].map(full_score_map)
+    enriched["floor_sqm"] = enriched["floor_area"].apply(_parse_floor_area_sqm)
+    _hmo_all = enriched.apply(
+        lambda r: _estimate_hmo_rooms(
+            r["beds_num"], r["floor_sqm"],
+            bathrooms=r.get("bathrooms"),
+            reception_rooms=r.get("reception_rooms"),
+            has_ensuite=bool(r.get("has_ensuite") or False),
+        ),
+        axis=1,
+    )
+    enriched["pot_rooms"]     = _hmo_all.apply(lambda x: x[0])
+    enriched["ensuite_rooms"] = _hmo_all.apply(lambda x: x[1])
+    enriched["est_monthly"]   = enriched["room_rent_est"] * enriched["pot_rooms"]
+    enriched["est_yield_pct"] = (
+        enriched["est_monthly"] * 12 / enriched["price_num"] * 100
+    ).where(enriched["price_num"] > 0)
+    _add_distance_cols(enriched)
+    print(f"Enriched dataset ready — {len(enriched):,} rows.")
 
     return {
         "total":               len(df),
@@ -1959,8 +2009,10 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         "five_plus":           five_plus,
         "affordable":          affordable_standard,
         "affordable_auction":  affordable_auction,
+        "affordable_near_station": near_station,
         "hotspots":            hotspots,
         "a4_excluded":         a4_excluded,
+        "enriched_df":         enriched,
     }
 
 
@@ -2055,8 +2107,8 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
             f"<td style='text-align:center'>{ens_str}</td>"
             f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
             f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
-            f"<td style='text-align:center'>{uni_str}</td>"
             f"<td style='text-align:center'>{sta_str}</td>"
+            f"<td style='text-align:center'>{uni_str}</td>"
             f"</tr>\n"
         )
     return rows
@@ -2082,15 +2134,21 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
   <tr style="background:{header_colour};color:#fff;">
     <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
     <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th>
-    <th>Est. Monthly</th><th>Est. Yield</th><th>Uni</th><th>Station</th>
+    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th>
   </tr>
   {rows}
 </table>"""
 
 
-def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame, affordable_auction: pd.DataFrame | None = None) -> str:
+def _build_email_html(
+    affordable: pd.DataFrame,
+    hotspots: pd.DataFrame,
+    affordable_auction: pd.DataFrame | None = None,
+    affordable_near_station: pd.DataFrame | None = None,
+) -> str:
     date_str = time.strftime("%d %B %Y")
     auction_df = affordable_auction if affordable_auction is not None else pd.DataFrame()
+    near_station_df = affordable_near_station if affordable_near_station is not None else pd.DataFrame()
 
     hotspot_rows = ""
     for i, row in hotspots.iterrows():
@@ -2121,6 +2179,9 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame, affordab
     auction_table = _property_table_html(
         auction_df, f"Auction Properties Under £{HMO_PRICE_THRESHOLD:,}", "#8e44ad"
     ) if not auction_df.empty else ""
+    near_station_table = _property_table_html(
+        near_station_df, "Top 100 Within 2km of a Station", "#1a5276"
+    ) if not near_station_df.empty else ""
 
     return f"""<html><body style="font-family:Arial,sans-serif;color:#222;max-width:960px;margin:auto;">
 <h2 style="color:#c0392b;border-bottom:2px solid #c0392b;padding-bottom:6px;">
@@ -2129,7 +2190,8 @@ def _build_email_html(affordable: pd.DataFrame, hotspots: pd.DataFrame, affordab
 <p>HMO conversion candidates (3+ bed house, not already HMO, not land) priced under
 <b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties in <b>Article 4 direction areas</b>
 have been excluded. Auction properties are listed separately below.</p>
-<p><b>{len(affordable):,} standard</b> + <b>{len(auction_df):,} auction</b> candidates.</p>
+<p><b>{len(affordable):,} standard</b> + <b>{len(auction_df):,} auction</b> candidates
+&middot; <b>{len(near_station_df):,}</b> within 2km of a station.</p>
 
 <h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>
 <p style="font-size:0.85em;color:#555;">
@@ -2148,6 +2210,7 @@ have been excluded. Auction properties are listed separately below.</p>
   {hotspot_rows}
 </table>
 
+{near_station_table}
 {standard_table}
 {auction_table}
 
@@ -2168,12 +2231,24 @@ def send_hmo_email(analysis: dict) -> None:
         print(f"No properties under £{HMO_PRICE_THRESHOLD:,} found — skipping email.")
         return
 
-    html = _build_email_html(affordable, analysis["hotspots"], analysis.get("affordable_auction"))
+    html = _build_email_html(
+        affordable,
+        analysis["hotspots"],
+        analysis.get("affordable_auction"),
+        analysis.get("affordable_near_station"),
+    )
 
     preview_path = BASE_DIR / "hmo_email_preview.html"
     with open(preview_path, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Preview written to {preview_path}")
+
+    enriched = analysis.get("enriched_df")
+    if enriched is not None and not enriched.empty:
+        date_str = time.strftime("%Y-%m-%d")
+        enriched_path = BASE_DIR / "data" / f"rightmove_with_extra_fields_{date_str}.parquet"
+        enriched.to_parquet(enriched_path, index=False)
+        print(f"Enriched dataset saved: {enriched_path.name}")
 
     if not gmail_user or not gmail_pass or not HMO_EMAIL_TO:
         print("GMAIL_USER / GMAIL_APP_PASSWORD / HMO_EMAIL_TO not set — skipping HMO email.")

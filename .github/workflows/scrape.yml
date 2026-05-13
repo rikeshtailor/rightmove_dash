@@ -36,7 +36,7 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install aiohttp pandas pyarrow beautifulsoup4 shapely
+        run: pip install aiohttp numpy pandas pyarrow beautifulsoup4 shapely
 
       - name: Run Rightmove scrape
         if: ${{ inputs.spareroom_only != true && inputs.analyse_only != true }}
@@ -80,3 +80,14 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           HMO_EMAIL_TO: ${{ secrets.HMO_EMAIL_TO }}
         run: python scraper_alternative.py --analyse-only
+
+      - name: Push enriched parquet to repo
+        if: ${{ inputs.rightmove_only != true && inputs.spareroom_only != true }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/rightmove_with_extra_fields_*.parquet || true
+          git diff --cached --quiet && echo "No enriched parquet to push." && exit 0
+          git commit -m "data: enriched fields $(date +'%Y-%m-%d')"
+          git pull --rebase
+          git push
