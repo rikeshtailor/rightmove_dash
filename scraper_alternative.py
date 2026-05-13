@@ -1922,7 +1922,6 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable["est_yield_pct"] = (
         affordable["est_monthly"] * 12 / affordable["price_num"] * 100
     ).where(affordable["price_num"] > 0)
-    affordable = affordable.sort_values("est_yield_pct", ascending=False)
     affordable = affordable[affordable["est_yield_pct"].fillna(0) <= 35].copy()
 
     # Per-property distances using each property's actual lat/lon
@@ -1937,6 +1936,12 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         })
 
     affordable[["dist_uni_km", "dist_sta_km", "dist_hosp_km"]] = affordable.apply(_prop_dists, axis=1)
+
+    affordable = affordable.sort_values(
+        ["dist_sta_km", "dist_uni_km", "est_monthly"],
+        ascending=[True, True, False],
+        na_position="last",
+    )
 
     is_auction = affordable["potential_auction"].fillna(False).astype(bool)
     affordable_standard = affordable[~is_auction].copy()
@@ -2056,7 +2061,7 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
     if total == 0:
         return f"<h3 style='margin-top:2em;'>{heading}</h3><p>No properties.</p>"
     note = (
-        f"Showing top {min(n, total):,} of {total:,} total, ranked by estimated gross yield.<br>"
+        f"Showing top {min(n, total):,} of {total:,} total, sorted by station distance &rarr; uni distance &rarr; est. monthly income (desc).<br>"
         "Score = outcode composite score &nbsp;|&nbsp; "
         "<b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms. "
         "<b>En-suite</b> = rooms estimated large enough to add a wet room. "
