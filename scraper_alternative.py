@@ -2157,13 +2157,20 @@ def send_hmo_email(analysis: dict) -> None:
     gmail_user = os.environ.get("GMAIL_USER", "").strip()
     gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
-    if not gmail_user or not gmail_pass or not HMO_EMAIL_TO:
-        print("GMAIL_USER / GMAIL_APP_PASSWORD / HMO_EMAIL_TO not set — skipping HMO email.")
-        return
-
     affordable = analysis["affordable"]
     if affordable.empty:
         print(f"No properties under £{HMO_PRICE_THRESHOLD:,} found — skipping email.")
+        return
+
+    html = _build_email_html(affordable, analysis["hotspots"], analysis.get("affordable_auction"))
+
+    preview_path = BASE_DIR / "hmo_email_preview.html"
+    with open(preview_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Preview written to {preview_path}")
+
+    if not gmail_user or not gmail_pass or not HMO_EMAIL_TO:
+        print("GMAIL_USER / GMAIL_APP_PASSWORD / HMO_EMAIL_TO not set — skipping HMO email.")
         return
 
     msg = MIMEMultipart("alternative")
@@ -2175,7 +2182,7 @@ def send_hmo_email(analysis: dict) -> None:
 
     msg["To"] = ", ".join(recipients)
     msg["From"] = gmail_user
-    msg.attach(MIMEText(_build_email_html(affordable, analysis["hotspots"], analysis.get("affordable_auction")), "html"))
+    msg.attach(MIMEText(html, "html"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
