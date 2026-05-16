@@ -1930,6 +1930,8 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         .reset_index(drop=True)
     )
 
+    _CONF_MULT = {"high": 1.0, "medium": 0.9, "low": 0.75}
+
     score_map = full_score_map
     affordable = hmo_candidates[hmo_candidates["price_num"] < HMO_PRICE_THRESHOLD].copy()
     affordable["hmo_score"] = affordable["outcode"].map(score_map)
@@ -1939,6 +1941,10 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     _rr = affordable["outcode"].apply(_room_rent)
     affordable["room_rent_est"]    = _rr.apply(lambda x: x[0])
     affordable["rent_confidence"]  = _rr.apply(lambda x: x[1])
+    affordable["hmo_score"] = (
+        affordable["hmo_score"].fillna(0)
+        * affordable["rent_confidence"].map(_CONF_MULT).fillna(_CONF_MULT["low"])
+    ).round(2)
     affordable["floor_sqm"] = affordable["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_est = affordable.apply(
         lambda r: _estimate_hmo_rooms(
@@ -1966,8 +1972,10 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         n = (s - lo) / (hi - lo) if hi > lo else pd.Series(0.5, index=s.index)
         return n if higher_better else (1 - n)
 
+    # yield contribution is also scaled by confidence — less reliable rent = less weight on yield
+    conf_mult = affordable["rent_confidence"].map(_CONF_MULT).fillna(_CONF_MULT["low"])
     affordable["_rank_score"] = (
-        _norm(affordable["est_yield_pct"].fillna(0),  higher_better=True)  * 0.50
+        _norm(affordable["est_yield_pct"].fillna(0),  higher_better=True)  * 0.50 * conf_mult
         + _norm(affordable["dist_sta_km"].fillna(999), higher_better=False) * 0.30
         + _norm(affordable["hmo_score"].fillna(0),    higher_better=True)  * 0.20
     )
