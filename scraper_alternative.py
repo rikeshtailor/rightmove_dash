@@ -1760,6 +1760,20 @@ def load_spareroom_rents(min_listings: int = 10) -> dict[str, float]:
     return rents
 
 
+def load_spareroom_counts(flatshare_type: str) -> dict[str, int]:
+    """Return outcode -> listing count from a SpareRoom parquet."""
+    path = DATA_DIR / f"spareroom_{flatshare_type}.parquet"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path, columns=["postcode"])
+    except Exception:
+        return {}
+    df["outcode"] = df["postcode"].fillna("").str.split().str[0].str.upper()
+    df = df[df["outcode"] != ""]
+    return df.groupby("outcode").size().to_dict()
+
+
 def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     """
     Identify HMO conversion candidates and score outcode hotspots.
@@ -1833,6 +1847,15 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     five_plus = df[df["beds_num"] >= 5].copy()
 
     spareroom_rents = load_spareroom_rents()
+
+    sr_offered_counts = load_spareroom_counts("offered")
+    sr_wanted_counts  = load_spareroom_counts("wanted")
+    sr_demand_ratio: dict[str, float] = {}
+    if sr_wanted_counts:  # only compute if wanted data is actually present
+        for oc, offered in sr_offered_counts.items():
+            wanted = sr_wanted_counts.get(oc, 0)
+            if offered > 0:
+                sr_demand_ratio[oc] = round(wanted / offered, 2)
 
     # Regional SpareRoom average: median of all outcodes sharing the same letter prefix
     # Used as fallback when specific outcode has insufficient listings
@@ -1963,6 +1986,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         affordable["est_monthly"] * 12 / affordable["price_num"] * 100
     ).where(affordable["price_num"] > 0)
     affordable = affordable[affordable["est_yield_pct"].fillna(0) <= 35].copy()
+    affordable["demand_ratio"] = affordable["outcode"].map(sr_demand_ratio)
 
     # Per-property distances using vectorized haversine
     _add_distance_cols(affordable)
@@ -1994,8 +2018,9 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     )
     enriched["room_rent_est"]   = _rr_enriched.apply(lambda x: x[0])
     enriched["rent_confidence"] = _rr_enriched.apply(lambda x: x[1])
-    enriched["hmo_score"] = enriched["outcode"].map(full_score_map)
-    enriched["floor_sqm"] = enriched["floor_area"].apply(_parse_floor_area_sqm)
+    enriched["hmo_score"]    = enriched["outcode"].map(full_score_map)
+    enriched["demand_ratio"] = enriched["outcode"].map(sr_demand_ratio)
+    enriched["floor_sqm"]    = enriched["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_all = enriched.apply(
         lambda r: _estimate_hmo_rooms(
             r["beds_num"], r["floor_sqm"],
@@ -2114,6 +2139,8 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
         sta_km   = r.get("dist_sta_km")
         uni_str  = f"{uni_km:.1f} km" if pd.notna(uni_km) else "-"
         sta_str  = f"{sta_km:.1f} km" if pd.notna(sta_km) else "-"
+        dr       = r.get("demand_ratio")
+        dr_str   = f"{dr:.2f}" if pd.notna(dr) else "-"
         rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}</a></td>"
@@ -2126,6 +2153,7 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
             f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
             f"<td style='text-align:center'>{sta_str}</td>"
             f"<td style='text-align:center'>{uni_str}</td>"
+            f"<td style='text-align:center'>{dr_str}</td>"
             f"</tr>\n"
         )
     return rows
@@ -2142,7 +2170,8 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
         "<b>Score</b> = outcode composite score (yield 50% &middot; HMO density 35% &middot; affordability 15%) &times; rent confidence multiplier. "
         "<b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms. "
         "<b>En-suite</b> = rooms estimated large enough to add a wet room. "
-        "<b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. All figures are estimates only."
+        "<b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. "
+        "<b>W:O</b> = SpareRoom wanted:offered ratio for the outcode &mdash; values &gt;1 indicate more people seeking rooms than are available. All figures are estimates only."
     )
     rows = _property_table_rows(df, n)
     return f"""
@@ -2153,7 +2182,7 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
   <tr style="background:{header_colour};color:#fff;">
     <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
     <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th>
-    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th>
+    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th><th>W:O</th>
   </tr>
   {rows}
 </table>"""
@@ -2489,8 +2518,7 @@ if __name__ == "__main__":
         run_analyse_only()
     elif SPAREROOM_ONLY:
         asyncio.run(run_spareroom("offered", retry_failed=RETRY_FAILED))
-        if not IS_CI:
-            asyncio.run(run_spareroom("wanted", retry_failed=RETRY_FAILED))
+        asyncio.run(run_spareroom("wanted", retry_failed=RETRY_FAILED))
     elif RETRY_FAILED and not RIGHTMOVE_ONLY:
         asyncio.run(run_retry_failed())
     else:
