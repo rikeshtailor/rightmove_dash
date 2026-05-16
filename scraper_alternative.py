@@ -1969,6 +1969,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             "score_density":   s_dens,
             "score_afford":    s_afford,
             "composite_score": round(composite, 2),
+            "demand_ratio":    sr_demand_ratio.get(oc),
         })
 
     full_score_map = {r["outcode"]: r["composite_score"] for r in rows}
@@ -2362,6 +2363,8 @@ def _build_email_html(
             "<span style='background:#95a5a6;color:#fff;padding:1px 5px;border-radius:3px;"
             "font-size:0.8em'>est.</span>"
         )
+        dr = row.get("demand_ratio")
+        dr_str = f"{dr:.2f}" if pd.notna(dr) else "-"
         hotspot_rows += (
             f"<tr>"
             f"<td>{i+1}</td><td><b>{row['outcode']}</b></td>"
@@ -2370,6 +2373,7 @@ def _build_email_html(
             f"<td>£{int(row['room_rent']):,}/mo {src_badge}</td>"
             f"<td>{row['est_yield']:.1f}%</td><td>{row['hmo_density']:.1f}%</td>"
             f"<td>{int(row['under_220k']):,}</td>"
+            f"<td style='text-align:center'>{dr_str}</td>"
             f"</tr>\n"
         )
 
@@ -2408,7 +2412,7 @@ have been excluded. Auction properties are listed separately below.</p>
   <tr style="background:#2c3e50;color:#fff;">
     <th>#</th><th>Area</th><th>Score</th><th>Listings</th>
     <th>Median Price</th><th>Room Rent</th><th>Est. Yield</th><th>HMO Density</th>
-    <th>Under £220k</th>
+    <th>Under £220k</th><th>Wanted:Offered</th>
   </tr>
   {hotspot_rows}
 </table>
