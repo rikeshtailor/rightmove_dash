@@ -51,7 +51,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git rm --ignore-unmatch data/rightmove_*.parquet || true
-          git add data/rightmove_*.parquet || true
+          git add -f data/rightmove_*.parquet || true
           git diff --cached --quiet && echo "No parquet to push." && exit 0
           git commit -m "data: scrape $(date +'%Y-%m-%d')"
           git push
@@ -67,7 +67,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/spareroom_offered.parquet || true
+          git add -f data/spareroom_offered.parquet || true
           git diff --cached --quiet && echo "No SpareRoom data to push." && exit 0
           git commit -m "data: spareroom $(date +'%Y-%m-%d')"
           git pull --rebase
@@ -88,7 +88,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git rm --ignore-unmatch data/rightmove_with_extra_fields_*.parquet || true
-          git add data/rightmove_with_extra_fields_*.parquet || true
+          git add -f data/rightmove_with_extra_fields_*.parquet || true
           git diff --cached --quiet && echo "No enriched parquet to push." && exit 0
           git commit -m "data: enriched fields $(date +'%Y-%m-%d')"
           git pull --rebase
