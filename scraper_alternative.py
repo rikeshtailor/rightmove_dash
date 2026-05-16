@@ -2227,10 +2227,18 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
     return rows
 
 
-def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: int = 100, rank_note: str = "est. yield 50% &middot; station proximity 30% &middot; area score 20%") -> str:
+def _property_table_html(
+    df: pd.DataFrame,
+    heading: str,
+    header_colour: str,
+    n: int = 25,
+    rank_note: str = "est. yield 50% &middot; station proximity 30% &middot; area score 20%",
+    anchor_id: str = "",
+) -> str:
     total = len(df)
+    anchor_attr = f' id="{anchor_id}"' if anchor_id else ""
     if total == 0:
-        return f"<h3 style='margin-top:2em;'>{heading}</h3><p>No properties.</p>"
+        return f"<details{anchor_attr}><summary style='cursor:pointer;font-size:1.05em;font-weight:bold;padding:8px 0;'>{heading} &mdash; no properties</summary></details>"
     note = (
         f"Showing top {min(n, total):,} of {total:,} total, ranked by composite score: {rank_note}.<br>"
         "Yield contribution is scaled by rent confidence: <b>SR</b> (10+ live listings) 1.0&times; &middot; "
@@ -2244,7 +2252,10 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
     )
     rows = _property_table_rows(df, n)
     return f"""
-<h3 style="margin-top:2em;">{heading}</h3>
+<details{anchor_attr}>
+<summary style="cursor:pointer;font-size:1.05em;font-weight:bold;padding:8px 0;color:{header_colour};">
+  {heading} &mdash; {total:,} candidates &nbsp;<span style="font-weight:normal;font-size:0.85em;color:#666;">(showing top {min(n,total):,} &mdash; click to expand)</span>
+</summary>
 <p style="font-size:0.85em;color:#555;">{note}</p>
 <table border="1" cellpadding="7" cellspacing="0"
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
@@ -2255,7 +2266,8 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
     <th>Wanted:Offered</th><th>Renters%</th><th>Students%</th><th>Employed%</th><th>Score</th>
   </tr>
   {rows}
-</table>"""
+</table>
+</details>"""
 
 
 def _property_table_rows_students(df: pd.DataFrame, n: int = 100) -> str:
@@ -2314,10 +2326,11 @@ def _property_table_rows_students(df: pd.DataFrame, n: int = 100) -> str:
     return rows
 
 
-def _property_table_html_students(df: pd.DataFrame, n: int = 100) -> str:
+def _property_table_html_students(df: pd.DataFrame, n: int = 25) -> str:
     total = len(df)
+    _colour = "#1a6b3c"
     if total == 0:
-        return "<h3 style='margin-top:2em;'>Top 100 Student Area Properties</h3><p>No properties.</p>"
+        return f"<details id='students'><summary style='cursor:pointer;font-size:1.05em;font-weight:bold;padding:8px 0;'>Student Area Properties &mdash; no properties</summary></details>"
     note = (
         f"Showing top {min(n, total):,} of {total:,} total, ranked by student-area composite score: "
         "est. yield 40% &middot; university proximity 30% &middot; Students% 20% &middot; wanted:offered demand 10%.<br>"
@@ -2328,18 +2341,22 @@ def _property_table_html_students(df: pd.DataFrame, n: int = 100) -> str:
     )
     rows = _property_table_rows_students(df, n)
     return f"""
-<h3 style="margin-top:2em;">Top 100 Student Area Properties</h3>
+<details id="students">
+<summary style="cursor:pointer;font-size:1.05em;font-weight:bold;padding:8px 0;color:{_colour};">
+  Student Area Properties &mdash; {total:,} candidates &nbsp;<span style="font-weight:normal;font-size:0.85em;color:#666;">(showing top {min(n,total):,} &mdash; click to expand)</span>
+</summary>
 <p style="font-size:0.85em;color:#555;">{note}</p>
 <table border="1" cellpadding="7" cellspacing="0"
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
-  <tr style="background:#1a6b3c;color:#fff;">
+  <tr style="background:{_colour};color:#fff;">
     <th>Address</th><th>Postcode</th><th>Type</th><th>Price</th><th>Beds</th>
     <th>Pot. Rooms</th><th>En-suite</th><th>Rent/rm</th>
     <th>Est. Monthly</th><th>Est. Yield</th><th>Uni</th><th>Nearest University</th>
     <th>Wanted:Offered</th><th>Students%</th><th>Score</th>
   </tr>
   {rows}
-</table>"""
+</table>
+</details>"""
 
 
 def _build_email_html(
@@ -2386,29 +2403,46 @@ def _build_email_html(
         )
 
     standard_table = _property_table_html(
-        affordable, f"Top 100 Properties Under £{HMO_PRICE_THRESHOLD:,}", "#c0392b"
+        affordable, f"Standard Properties Under £{HMO_PRICE_THRESHOLD:,}", "#c0392b",
+        anchor_id="standard",
     )
     auction_table = _property_table_html(
-        auction_df, f"Auction Properties Under £{HMO_PRICE_THRESHOLD:,}", "#8e44ad"
+        auction_df, f"Auction Properties Under £{HMO_PRICE_THRESHOLD:,}", "#8e44ad",
+        anchor_id="auction",
     ) if not auction_df.empty else ""
     near_station_table = _property_table_html(
-        near_station_df, "Top 100 Within 2km of a Station", "#1a5276",
+        near_station_df, "Within 2km of a Station", "#1a5276",
         rank_note="est. yield 45% &middot; station proximity 30% &middot; area score 15% &middot; wanted:offered demand 10%",
+        anchor_id="near-station",
     ) if not near_station_df.empty else ""
     students_df = affordable_students if affordable_students is not None else pd.DataFrame()
     student_table = _property_table_html_students(students_df) if not students_df.empty else ""
+
+    nav_items = [
+        ('<a href="#hotspots" style="color:#2c3e50;font-weight:bold;text-decoration:none;">Hotspots</a>', True),
+        (f'<a href="#near-station" style="color:#1a5276;font-weight:bold;text-decoration:none;">Near Station</a> <span style="color:#888;font-size:0.9em;">({len(near_station_df):,})</span>', not near_station_df.empty),
+        (f'<a href="#students" style="color:#1a6b3c;font-weight:bold;text-decoration:none;">Student Areas</a> <span style="color:#888;font-size:0.9em;">({len(students_df):,})</span>', not students_df.empty),
+        (f'<a href="#standard" style="color:#c0392b;font-weight:bold;text-decoration:none;">Standard</a> <span style="color:#888;font-size:0.9em;">({len(affordable):,})</span>', True),
+        (f'<a href="#auction" style="color:#8e44ad;font-weight:bold;text-decoration:none;">Auction</a> <span style="color:#888;font-size:0.9em;">({len(auction_df):,})</span>', not auction_df.empty),
+    ]
+    nav_html = " &nbsp;&middot;&nbsp; ".join(item for item, show in nav_items if show)
 
     return f"""<html><body style="font-family:Arial,sans-serif;color:#222;max-width:960px;margin:auto;">
 <h2 style="color:#c0392b;border-bottom:2px solid #c0392b;padding-bottom:6px;">
   HMO Opportunity Report &mdash; {date_str}
 </h2>
-<p>HMO conversion candidates (3+ bed house, not already HMO, not land) priced under
-<b>£{HMO_PRICE_THRESHOLD:,}</b>. Properties in <b>Article 4 direction areas</b>
-have been excluded. Auction properties are listed separately below.</p>
-<p><b>{len(affordable):,} standard</b> + <b>{len(auction_df):,} auction</b> candidates
-&middot; <b>{len(near_station_df):,}</b> within 2km of a station.</p>
 
-<h3 style="margin-top:1.8em;">Top HMO Hotspots</h3>
+<div style="background:#f4f4f4;border:1px solid #ddd;border-radius:6px;padding:10px 16px;margin-bottom:1.2em;font-size:0.92em;">
+  {nav_html}
+</div>
+
+<p style="font-size:0.9em;">HMO conversion candidates (3+ bed house, not already HMO, not land) priced under
+<b>£{HMO_PRICE_THRESHOLD:,}</b>. Article 4 direction areas excluded. Each section is collapsed &mdash; click a heading to expand.</p>
+
+<details id="hotspots" open>
+<summary style="cursor:pointer;font-size:1.05em;font-weight:bold;padding:8px 0;color:#2c3e50;">
+  Top HMO Hotspots &mdash; top 20 outcodes by composite score
+</summary>
 <p style="font-size:0.85em;color:#555;">
   <b>Score (0-10)</b> weighted composite: estimated gross yield 50% &middot; HMO density 35% &middot; affordability 15%.<br>
   <b>HMO Density</b> = percentage of house listings in that outcode whose description mentions &ldquo;HMO&rdquo; &mdash;
@@ -2424,6 +2458,7 @@ have been excluded. Auction properties are listed separately below.</p>
   </tr>
   {hotspot_rows}
 </table>
+</details>
 
 {near_station_table}
 {student_table}
