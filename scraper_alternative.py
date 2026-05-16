@@ -2167,11 +2167,10 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
         rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}</a></td>"
-            f"<td>{pc}</td><td>{price}</td><td>{beds}</td><td>{ptype}</td>"
-            f"<td style='text-align:center'>{score_str}</td>"
-            f"<td style='text-align:center'>{rr_str}</td>"
+            f"<td>{pc}</td><td>{ptype}</td><td>{price}</td><td>{beds}</td>"
             f"<td style='text-align:center'>{pot_str}</td>"
             f"<td style='text-align:center'>{ens_str}</td>"
+            f"<td style='text-align:center'>{rr_str}</td>"
             f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
             f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
             f"<td style='text-align:center'>{sta_str}</td>"
@@ -2180,6 +2179,7 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
             f"<td style='text-align:center'>{renters_str}</td>"
             f"<td style='text-align:center'>{students_str}</td>"
             f"<td style='text-align:center'>{employed_str}</td>"
+            f"<td style='text-align:center'>{score_str}</td>"
             f"</tr>\n"
         )
     return rows
@@ -2207,9 +2207,10 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
 <table border="1" cellpadding="7" cellspacing="0"
        style="border-collapse:collapse;width:100%;font-size:0.88em;">
   <tr style="background:{header_colour};color:#fff;">
-    <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
-    <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th>
-    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th><th>W:O</th><th>Renters%</th><th>Students%</th><th>Employed%</th>
+    <th>Address</th><th>Postcode</th><th>Type</th><th>Price</th><th>Beds</th>
+    <th>Pot. Rooms</th><th>En-suite</th><th>Rent/rm</th>
+    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th>
+    <th>Wanted:Offered</th><th>Renters%</th><th>Students%</th><th>Employed%</th><th>Score</th>
   </tr>
   {rows}
 </table>"""
