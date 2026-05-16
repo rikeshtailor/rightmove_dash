@@ -529,7 +529,7 @@ def _nearest_km_vec(lats: np.ndarray, lons: np.ndarray, pois: list) -> np.ndarra
 
 
 def _add_distance_cols(df: pd.DataFrame) -> None:
-    """Add dist_uni_km, dist_sta_km, dist_hosp_km in-place using vectorized haversine."""
+    """Add dist_uni_km, dist_sta_km, dist_hosp_km (and nearest_uni_name) in-place."""
     lats = pd.to_numeric(df["latitude"],  errors="coerce").to_numpy(dtype=float)
     lons = pd.to_numeric(df["longitude"], errors="coerce").to_numpy(dtype=float)
     valid = ~(np.isnan(lats) | np.isnan(lons))
@@ -542,6 +542,22 @@ def _add_distance_cols(df: pd.DataFrame) -> None:
         if valid.any():
             arr[valid] = _nearest_km_vec(lats[valid], lons[valid], pois)
         df[col] = np.round(arr, 1)
+
+    # Nearest university name
+    uni_names = np.full(len(df), None, dtype=object)
+    if valid.any() and UK_UNIVERSITIES:
+        poi_lats = np.radians(np.array([p[1] for p in UK_UNIVERSITIES]))
+        poi_lons = np.radians(np.array([p[2] for p in UK_UNIVERSITIES]))
+        prop_lats = np.radians(lats[valid])[:, None]
+        prop_lons = np.radians(lons[valid])[:, None]
+        dlat = poi_lats - prop_lats
+        dlon = poi_lons - prop_lons
+        a = np.sin(dlat / 2) ** 2 + np.cos(prop_lats) * np.cos(poi_lats) * np.sin(dlon / 2) ** 2
+        dists = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        nearest_idx = dists.argmin(axis=1)
+        uni_names_list = [p[0] for p in UK_UNIVERSITIES]
+        uni_names[valid] = [uni_names_list[i] for i in nearest_idx]
+    df["nearest_uni_name"] = uni_names
 
 
 def _score_lower_better(value: float, breakpoints: list) -> int:
@@ -2024,6 +2040,16 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable_auction  = affordable[is_auction].copy()
     near_station = affordable_standard[affordable_standard["dist_sta_km"].fillna(999) < 2].copy()
 
+    # ── Student-focused ranking ───────────────────────────────────────────────
+    _conf_std = affordable_standard["rent_confidence"].map(_CONF_MULT).fillna(_CONF_MULT["low"])
+    affordable_standard["student_score"] = (
+        _norm(affordable_standard["est_yield_pct"].fillna(0),  higher_better=True)  * 0.40 * _conf_std
+        + _norm(affordable_standard["dist_uni_km"].fillna(999), higher_better=False) * 0.30
+        + _norm(affordable_standard["pct_students"].fillna(0),  higher_better=True)  * 0.20
+        + _norm(affordable_standard["demand_ratio"].fillna(0),  higher_better=True)  * 0.10
+    ).round(3)
+    affordable_students = affordable_standard.sort_values("student_score", ascending=False).copy()
+
     # ── Enrich complete dataset with same derived fields ──────────────────────
     print("Building enriched dataset …")
     enriched = df.copy()
@@ -2063,6 +2089,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         "affordable":          affordable_standard,
         "affordable_auction":  affordable_auction,
         "affordable_near_station": near_station,
+        "affordable_students":     affordable_students,
         "hotspots":            hotspots,
         "a4_excluded":         a4_excluded,
         "enriched_df":         enriched,
@@ -2216,11 +2243,96 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
 </table>"""
 
 
+def _property_table_rows_students(df: pd.DataFrame, n: int = 100) -> str:
+    rows = ""
+    for _, r in df.head(n).iterrows():
+        price       = f"£{int(r['price_num']):,}" if pd.notna(r["price_num"]) else "-"
+        beds        = str(int(r["beds_num"])) if pd.notna(r["beds_num"]) else "?"
+        addr        = r.get("address") or "View listing"
+        ptype       = r.get("property_type") or "-"
+        pc          = r.get("postcode") or "-"
+        score       = r.get("student_score")
+        score_str   = f"{score:.3f}" if pd.notna(score) else "-"
+        rr          = r.get("room_rent_est")
+        conf        = r.get("rent_confidence", "low")
+        conf_badge  = {
+            "high":   "<span style='background:#27ae60;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.75em'>SR</span>",
+            "medium": "<span style='background:#e67e22;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.75em'>reg</span>",
+            "low":    "<span style='background:#95a5a6;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.75em'>est</span>",
+        }.get(conf, "")
+        rr_str      = f"£{int(rr):,} {conf_badge}" if pd.notna(rr) else "-"
+        pot         = r.get("pot_rooms")
+        pot_str     = str(int(pot)) if pd.notna(pot) else "-"
+        ens         = r.get("ensuite_rooms")
+        ens_str     = str(int(ens)) if pd.notna(ens) else "-"
+        monthly     = r.get("est_monthly")
+        monthly_str = f"£{int(monthly):,}" if pd.notna(monthly) else "-"
+        gross_yield = r.get("est_yield_pct")
+        yield_str   = f"{gross_yield:.1f}%" if pd.notna(gross_yield) else "-"
+        yield_col   = (
+            "#27ae60" if pd.notna(gross_yield) and gross_yield >= 10 else
+            ("#e67e22" if pd.notna(gross_yield) and gross_yield >= 7 else "#c0392b")
+        )
+        uni_km      = r.get("dist_uni_km")
+        uni_str     = f"{uni_km:.1f} km" if pd.notna(uni_km) else "-"
+        uni_name    = r.get("nearest_uni_name") or "-"
+        dr          = r.get("demand_ratio")
+        dr_str      = f"{dr:.2f}" if pd.notna(dr) else "-"
+        students    = r.get("pct_students")
+        students_str = f"{students:.1f}%" if pd.notna(students) else "-"
+        rows += (
+            f"<tr>"
+            f"<td><a href='{r['url']}'>{addr}</a></td>"
+            f"<td>{pc}</td><td>{ptype}</td><td>{price}</td><td>{beds}</td>"
+            f"<td style='text-align:center'>{pot_str}</td>"
+            f"<td style='text-align:center'>{ens_str}</td>"
+            f"<td style='text-align:center'>{rr_str}</td>"
+            f"<td style='text-align:right;font-weight:bold'>{monthly_str}</td>"
+            f"<td style='text-align:center;font-weight:bold;color:{yield_col}'>{yield_str}</td>"
+            f"<td style='text-align:center'>{uni_str}</td>"
+            f"<td style='text-align:left;font-size:0.85em'>{uni_name}</td>"
+            f"<td style='text-align:center'>{dr_str}</td>"
+            f"<td style='text-align:center'>{students_str}</td>"
+            f"<td style='text-align:center'>{score_str}</td>"
+            f"</tr>\n"
+        )
+    return rows
+
+
+def _property_table_html_students(df: pd.DataFrame, n: int = 100) -> str:
+    total = len(df)
+    if total == 0:
+        return "<h3 style='margin-top:2em;'>Top 100 Student Area Properties</h3><p>No properties.</p>"
+    note = (
+        f"Showing top {min(n, total):,} of {total:,} total, ranked by student-area composite score: "
+        "est. yield 40% &middot; university proximity 30% &middot; Students% 20% &middot; wanted:offered demand 10%.<br>"
+        "Yield contribution is scaled by rent confidence: <b>SR</b> (10+ live listings) 1.0&times; &middot; "
+        "<b>reg</b> (SpareRoom regional average) 0.70&times; &middot; <b>est</b> (hardcoded table) 0.55&times;.<br>"
+        "<b>Nearest University</b> = closest university by straight-line distance. "
+        "<b>Students%</b> = Census 2021 share of full-time students in the outcode (ONS NOMIS). All figures are estimates only."
+    )
+    rows = _property_table_rows_students(df, n)
+    return f"""
+<h3 style="margin-top:2em;">Top 100 Student Area Properties</h3>
+<p style="font-size:0.85em;color:#555;">{note}</p>
+<table border="1" cellpadding="7" cellspacing="0"
+       style="border-collapse:collapse;width:100%;font-size:0.88em;">
+  <tr style="background:#1a6b3c;color:#fff;">
+    <th>Address</th><th>Postcode</th><th>Type</th><th>Price</th><th>Beds</th>
+    <th>Pot. Rooms</th><th>En-suite</th><th>Rent/rm</th>
+    <th>Est. Monthly</th><th>Est. Yield</th><th>Uni</th><th>Nearest University</th>
+    <th>Wanted:Offered</th><th>Students%</th><th>Score</th>
+  </tr>
+  {rows}
+</table>"""
+
+
 def _build_email_html(
     affordable: pd.DataFrame,
     hotspots: pd.DataFrame,
     affordable_auction: pd.DataFrame | None = None,
     affordable_near_station: pd.DataFrame | None = None,
+    affordable_students: pd.DataFrame | None = None,
 ) -> str:
     date_str = time.strftime("%d %B %Y")
     auction_df = affordable_auction if affordable_auction is not None else pd.DataFrame()
@@ -2258,6 +2370,8 @@ def _build_email_html(
     near_station_table = _property_table_html(
         near_station_df, "Top 100 Within 2km of a Station", "#1a5276"
     ) if not near_station_df.empty else ""
+    students_df = affordable_students if affordable_students is not None else pd.DataFrame()
+    student_table = _property_table_html_students(students_df) if not students_df.empty else ""
 
     return f"""<html><body style="font-family:Arial,sans-serif;color:#222;max-width:960px;margin:auto;">
 <h2 style="color:#c0392b;border-bottom:2px solid #c0392b;padding-bottom:6px;">
@@ -2287,6 +2401,7 @@ have been excluded. Auction properties are listed separately below.</p>
 </table>
 
 {near_station_table}
+{student_table}
 {standard_table}
 {auction_table}
 
@@ -2312,6 +2427,7 @@ def send_hmo_email(analysis: dict) -> None:
         analysis["hotspots"],
         analysis.get("affordable_auction"),
         analysis.get("affordable_near_station"),
+        analysis.get("affordable_students"),
     )
 
     preview_path = BASE_DIR / "hmo_email_preview.html"
