@@ -1930,7 +1930,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         .reset_index(drop=True)
     )
 
-    _CONF_MULT = {"high": 1.0, "medium": 0.9, "low": 0.75}
+    _CONF_MULT = {"high": 1.0, "medium": 0.70, "low": 0.55}
 
     score_map = full_score_map
     affordable = hmo_candidates[hmo_candidates["price_num"] < HMO_PRICE_THRESHOLD].copy()
