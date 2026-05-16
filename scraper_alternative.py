@@ -1760,6 +1760,14 @@ def load_spareroom_rents(min_listings: int = 10) -> dict[str, float]:
     return rents
 
 
+def load_nomis_stats() -> pd.DataFrame:
+    """Load Census 2021 outcode-level stats from the static lookup CSV."""
+    path = BASE_DIR / "data" / "nomis_outcode_stats.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["outcode", "pct_private_rented", "pct_students", "pct_employed"])
+    return pd.read_csv(path, dtype={"outcode": str})
+
+
 def load_spareroom_counts(flatshare_type: str) -> dict[str, int]:
     """Return outcode -> listing count from a SpareRoom parquet."""
     path = DATA_DIR / f"spareroom_{flatshare_type}.parquet"
@@ -1847,6 +1855,9 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     five_plus = df[df["beds_num"] >= 5].copy()
 
     spareroom_rents = load_spareroom_rents()
+
+    nomis = load_nomis_stats().set_index("outcode")
+    nomis_map = nomis.to_dict("index")  # outcode -> {pct_private_rented, pct_students, pct_employed}
 
     sr_offered_counts = load_spareroom_counts("offered")
     sr_wanted_counts  = load_spareroom_counts("wanted")
@@ -1986,7 +1997,10 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         affordable["est_monthly"] * 12 / affordable["price_num"] * 100
     ).where(affordable["price_num"] > 0)
     affordable = affordable[affordable["est_yield_pct"].fillna(0) <= 35].copy()
-    affordable["demand_ratio"] = affordable["outcode"].map(sr_demand_ratio)
+    affordable["demand_ratio"]      = affordable["outcode"].map(sr_demand_ratio)
+    affordable["pct_private_rented"] = affordable["outcode"].map(lambda o: nomis_map.get(o, {}).get("pct_private_rented"))
+    affordable["pct_students"]       = affordable["outcode"].map(lambda o: nomis_map.get(o, {}).get("pct_students"))
+    affordable["pct_employed"]       = affordable["outcode"].map(lambda o: nomis_map.get(o, {}).get("pct_employed"))
 
     # Per-property distances using vectorized haversine
     _add_distance_cols(affordable)
@@ -2018,8 +2032,11 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     )
     enriched["room_rent_est"]   = _rr_enriched.apply(lambda x: x[0])
     enriched["rent_confidence"] = _rr_enriched.apply(lambda x: x[1])
-    enriched["hmo_score"]    = enriched["outcode"].map(full_score_map)
-    enriched["demand_ratio"] = enriched["outcode"].map(sr_demand_ratio)
+    enriched["hmo_score"]            = enriched["outcode"].map(full_score_map)
+    enriched["demand_ratio"]         = enriched["outcode"].map(sr_demand_ratio)
+    enriched["pct_private_rented"]   = enriched["outcode"].map(lambda o: nomis_map.get(o, {}).get("pct_private_rented"))
+    enriched["pct_students"]         = enriched["outcode"].map(lambda o: nomis_map.get(o, {}).get("pct_students"))
+    enriched["pct_employed"]         = enriched["outcode"].map(lambda o: nomis_map.get(o, {}).get("pct_employed"))
     enriched["floor_sqm"]    = enriched["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_all = enriched.apply(
         lambda r: _estimate_hmo_rooms(
@@ -2141,6 +2158,12 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
         sta_str  = f"{sta_km:.1f} km" if pd.notna(sta_km) else "-"
         dr       = r.get("demand_ratio")
         dr_str   = f"{dr:.2f}" if pd.notna(dr) else "-"
+        renters  = r.get("pct_private_rented")
+        students = r.get("pct_students")
+        employed = r.get("pct_employed")
+        renters_str  = f"{renters:.1f}%"  if pd.notna(renters)  else "-"
+        students_str = f"{students:.1f}%" if pd.notna(students) else "-"
+        employed_str = f"{employed:.1f}%" if pd.notna(employed) else "-"
         rows += (
             f"<tr>"
             f"<td><a href='{r['url']}'>{addr}</a></td>"
@@ -2154,6 +2177,9 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
             f"<td style='text-align:center'>{sta_str}</td>"
             f"<td style='text-align:center'>{uni_str}</td>"
             f"<td style='text-align:center'>{dr_str}</td>"
+            f"<td style='text-align:center'>{renters_str}</td>"
+            f"<td style='text-align:center'>{students_str}</td>"
+            f"<td style='text-align:center'>{employed_str}</td>"
             f"</tr>\n"
         )
     return rows
@@ -2171,7 +2197,8 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
         "<b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms. "
         "<b>En-suite</b> = rooms estimated large enough to add a wet room. "
         "<b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. "
-        "<b>W:O</b> = SpareRoom wanted:offered ratio for the outcode &mdash; values &gt;1 indicate more people seeking rooms than are available. All figures are estimates only."
+        "<b>W:O</b> = SpareRoom wanted:offered ratio for the outcode &mdash; values &gt;1 indicate more people seeking rooms than available. "
+        "<b>Renters%</b> / <b>Students%</b> / <b>Employed%</b> = Census 2021 outcode averages (ONS NOMIS). All figures are estimates only."
     )
     rows = _property_table_rows(df, n)
     return f"""
@@ -2182,7 +2209,7 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
   <tr style="background:{header_colour};color:#fff;">
     <th>Address</th><th>Postcode</th><th>Price</th><th>Beds</th><th>Type</th>
     <th>Score</th><th>Rent/rm</th><th>Pot. Rooms</th><th>En-suite</th>
-    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th><th>W:O</th>
+    <th>Est. Monthly</th><th>Est. Yield</th><th>Station</th><th>Uni</th><th>W:O</th><th>Renters%</th><th>Students%</th><th>Employed%</th>
   </tr>
   {rows}
 </table>"""
