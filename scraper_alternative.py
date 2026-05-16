@@ -1843,19 +1843,22 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
             sr_region_rents.setdefault(prefix.group(1), []).append(rent)  # type: ignore[arg-type]
     sr_region_rents = {k: float(pd.Series(v).median()) for k, v in sr_region_rents.items()}  # type: ignore[assignment]
 
-    def _room_rent(outcode: str) -> int:
+    def _room_rent(outcode: str) -> tuple[int, str]:
+        """Return (monthly_rent, confidence) where confidence is high/medium/low."""
         regional = _get_room_rent(outcode)
         if outcode in spareroom_rents:
             raw = int(spareroom_rents[outcode])
+            confidence = "high"
         else:
             prefix = re.match(r"^([A-Z]+)", outcode) if outcode else None
             if prefix and prefix.group(1) in sr_region_rents:
                 raw = int(sr_region_rents[prefix.group(1)])
+                confidence = "medium"
             else:
-                return regional
+                return regional, "low"
         # Sanity cap: SpareRoom value must not exceed 2.5x regional estimate
         # Guards against whole-flat listings skewing outcode medians
-        return min(raw, max(regional * 2, 800))
+        return min(raw, max(regional * 2, 800)), confidence
 
     all_houses = df[df["is_house"] & df["outcode"].notna() & (df["outcode"] != "")]
 
@@ -1882,7 +1885,7 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         med_price = row["median_price"]
         avg_beds  = row["avg_beds"]
 
-        room_rent   = _room_rent(oc)
+        room_rent, _conf = _room_rent(oc)
         rent_source = "spareroom" if oc in spareroom_rents else "regional"
 
         density = hmo_density.get(oc, 0.0)
@@ -1933,7 +1936,9 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable = affordable.sort_values(["hmo_score", "price_num"], ascending=[False, True])
 
     # Per-property HMO income estimates
-    affordable["room_rent_est"] = affordable["outcode"].apply(_room_rent)
+    _rr = affordable["outcode"].apply(_room_rent)
+    affordable["room_rent_est"]    = _rr.apply(lambda x: x[0])
+    affordable["rent_confidence"]  = _rr.apply(lambda x: x[1])
     affordable["floor_sqm"] = affordable["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_est = affordable.apply(
         lambda r: _estimate_hmo_rooms(
@@ -1976,9 +1981,11 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     # ── Enrich complete dataset with same derived fields ──────────────────────
     print("Building enriched dataset …")
     enriched = df.copy()
-    enriched["room_rent_est"] = enriched["outcode"].apply(
-        lambda oc: _room_rent(str(oc)) if pd.notna(oc) and str(oc).strip() else None
+    _rr_enriched = enriched["outcode"].apply(
+        lambda oc: _room_rent(str(oc)) if pd.notna(oc) and str(oc).strip() else (None, "low")
     )
+    enriched["room_rent_est"]   = _rr_enriched.apply(lambda x: x[0])
+    enriched["rent_confidence"] = _rr_enriched.apply(lambda x: x[1])
     enriched["hmo_score"] = enriched["outcode"].map(full_score_map)
     enriched["floor_sqm"] = enriched["floor_area"].apply(_parse_floor_area_sqm)
     _hmo_all = enriched.apply(
@@ -2076,7 +2083,13 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
         score       = r.get("hmo_score")
         score_str   = f"{score:.1f}" if pd.notna(score) else "-"
         rr          = r.get("room_rent_est")
-        rr_str      = f"£{int(rr):,}" if pd.notna(rr) else "-"
+        conf        = r.get("rent_confidence", "low")
+        conf_badge  = {
+            "high":   "<span style='background:#27ae60;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.75em'>SR</span>",
+            "medium": "<span style='background:#e67e22;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.75em'>reg</span>",
+            "low":    "<span style='background:#95a5a6;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.75em'>est</span>",
+        }.get(conf, "")
+        rr_str      = f"£{int(rr):,} {conf_badge}" if pd.notna(rr) else "-"
         pot         = r.get("pot_rooms")
         pot_str     = str(int(pot)) if pd.notna(pot) else "-"
         ens         = r.get("ensuite_rooms")
