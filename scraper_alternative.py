@@ -2040,6 +2040,16 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     affordable_auction  = affordable[is_auction].copy()
     near_station = affordable_standard[affordable_standard["dist_sta_km"].fillna(999) < 2].copy()
 
+    # ── Near-station ranking: yield 45% + station 30% + hmo_score 15% + demand 10% ──
+    _conf_ns = near_station["rent_confidence"].map(_CONF_MULT).fillna(_CONF_MULT["low"])
+    near_station["_ns_score"] = (
+        _norm(near_station["est_yield_pct"].fillna(0),  higher_better=True)  * 0.45 * _conf_ns
+        + _norm(near_station["dist_sta_km"].fillna(999), higher_better=False) * 0.30
+        + _norm(near_station["hmo_score"].fillna(0),    higher_better=True)  * 0.15
+        + _norm(near_station["demand_ratio"].fillna(0), higher_better=True)  * 0.10
+    )
+    near_station = near_station.sort_values("_ns_score", ascending=False).drop(columns="_ns_score")
+
     # ── Student-focused ranking ───────────────────────────────────────────────
     _conf_std = affordable_standard["rent_confidence"].map(_CONF_MULT).fillna(_CONF_MULT["low"])
     affordable_standard["student_score"] = (
@@ -2214,12 +2224,12 @@ def _property_table_rows(df: pd.DataFrame, n: int = 100) -> str:
     return rows
 
 
-def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: int = 100) -> str:
+def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: int = 100, rank_note: str = "est. yield 50% &middot; station proximity 30% &middot; area score 20%") -> str:
     total = len(df)
     if total == 0:
         return f"<h3 style='margin-top:2em;'>{heading}</h3><p>No properties.</p>"
     note = (
-        f"Showing top {min(n, total):,} of {total:,} total, ranked by composite score: est. yield 50% &middot; station proximity 30% &middot; area score 20%.<br>"
+        f"Showing top {min(n, total):,} of {total:,} total, ranked by composite score: {rank_note}.<br>"
         "Yield contribution is scaled by rent confidence: <b>SR</b> (10+ live listings) 1.0&times; &middot; "
         "<b>reg</b> (SpareRoom regional average) 0.70&times; &middot; <b>est</b> (hardcoded table) 0.55&times;.<br>"
         "<b>Score</b> = outcode composite score (yield 50% &middot; HMO density 35% &middot; affordability 15%) &times; rent confidence multiplier. "
@@ -2370,7 +2380,8 @@ def _build_email_html(
         auction_df, f"Auction Properties Under £{HMO_PRICE_THRESHOLD:,}", "#8e44ad"
     ) if not auction_df.empty else ""
     near_station_table = _property_table_html(
-        near_station_df, "Top 100 Within 2km of a Station", "#1a5276"
+        near_station_df, "Top 100 Within 2km of a Station", "#1a5276",
+        rank_note="est. yield 45% &middot; station proximity 30% &middot; area score 15% &middot; wanted:offered demand 10%",
     ) if not near_station_df.empty else ""
     students_df = affordable_students if affordable_students is not None else pd.DataFrame()
     student_table = _property_table_html_students(students_df) if not students_df.empty else ""
