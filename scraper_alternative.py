@@ -2043,11 +2043,13 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
     # ── Student-focused ranking ───────────────────────────────────────────────
     _conf_std = affordable_standard["rent_confidence"].map(_CONF_MULT).fillna(_CONF_MULT["low"])
     affordable_standard["student_score"] = (
-        _norm(affordable_standard["est_yield_pct"].fillna(0),  higher_better=True)  * 0.40 * _conf_std
-        + _norm(affordable_standard["dist_uni_km"].fillna(999), higher_better=False) * 0.30
-        + _norm(affordable_standard["pct_students"].fillna(0),  higher_better=True)  * 0.20
-        + _norm(affordable_standard["demand_ratio"].fillna(0),  higher_better=True)  * 0.10
-    ).round(3)
+        (
+            _norm(affordable_standard["est_yield_pct"].fillna(0),  higher_better=True)  * 0.40 * _conf_std
+            + _norm(affordable_standard["dist_uni_km"].fillna(999), higher_better=False) * 0.30
+            + _norm(affordable_standard["pct_students"].fillna(0),  higher_better=True)  * 0.20
+            + _norm(affordable_standard["demand_ratio"].fillna(0),  higher_better=True)  * 0.10
+        ) * 10
+    ).round(2)
     affordable_students = affordable_standard.sort_values("student_score", ascending=False).copy()
 
     # ── Enrich complete dataset with same derived fields ──────────────────────
@@ -2252,7 +2254,7 @@ def _property_table_rows_students(df: pd.DataFrame, n: int = 100) -> str:
         ptype       = r.get("property_type") or "-"
         pc          = r.get("postcode") or "-"
         score       = r.get("student_score")
-        score_str   = f"{score:.3f}" if pd.notna(score) else "-"
+        score_str   = f"{score:.1f}" if pd.notna(score) else "-"
         rr          = r.get("room_rent_est")
         conf        = r.get("rent_confidence", "low")
         conf_badge  = {
