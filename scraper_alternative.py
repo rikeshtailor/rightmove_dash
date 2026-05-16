@@ -2137,7 +2137,9 @@ def _property_table_html(df: pd.DataFrame, heading: str, header_colour: str, n: 
         return f"<h3 style='margin-top:2em;'>{heading}</h3><p>No properties.</p>"
     note = (
         f"Showing top {min(n, total):,} of {total:,} total, ranked by composite score: est. yield 50% &middot; station proximity 30% &middot; area score 20%.<br>"
-        "Score = outcode composite score &nbsp;|&nbsp; "
+        "Yield contribution is scaled by rent confidence: <b>SR</b> (10+ live listings) 1.0&times; &middot; "
+        "<b>reg</b> (SpareRoom regional average) 0.70&times; &middot; <b>est</b> (hardcoded table) 0.55&times;.<br>"
+        "<b>Score</b> = outcode composite score (yield 50% &middot; HMO density 35% &middot; affordability 15%) &times; rent confidence multiplier. "
         "<b>Pot. Rooms</b> = estimated HMO rooms after converting reception rooms. "
         "<b>En-suite</b> = rooms estimated large enough to add a wet room. "
         "<b>Est. Monthly</b> = Rent/rm &times; Pot. Rooms. All figures are estimates only."
