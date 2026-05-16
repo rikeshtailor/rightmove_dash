@@ -1696,7 +1696,7 @@ def _flag_article4(df: pd.DataFrame, tree, geoms: list) -> pd.Series:
 # HMO ANALYSIS & EMAIL
 # ============================================================
 
-def load_spareroom_rents(min_listings: int = 3) -> dict[str, float]:
+def load_spareroom_rents(min_listings: int = 10) -> dict[str, float]:
     """
     Return outcode -> median monthly rent (£) from SpareRoom offered data.
     Reads consolidated parquet if present, otherwise falls back to shards.
@@ -1882,12 +1882,8 @@ def analyse_hmo_opportunities(df: pd.DataFrame) -> dict:
         med_price = row["median_price"]
         avg_beds  = row["avg_beds"]
 
-        if oc in spareroom_rents:
-            room_rent   = spareroom_rents[oc]
-            rent_source = "spareroom"
-        else:
-            room_rent   = _room_rent(oc)
-            rent_source = "regional"
+        room_rent   = _room_rent(oc)
+        rent_source = "spareroom" if oc in spareroom_rents else "regional"
 
         density = hmo_density.get(oc, 0.0)
 
