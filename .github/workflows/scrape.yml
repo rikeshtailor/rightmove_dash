@@ -70,7 +70,7 @@ jobs:
           git add -f data/spareroom_offered.parquet data/spareroom_wanted.parquet 2>/dev/null || true
           git diff --cached --quiet && echo "No SpareRoom data to push." && exit 0
           git commit -m "data: spareroom $(date +'%Y-%m-%d')"
-          git pull --rebase
+          git pull --rebase --autostash
           git push
 
       - name: Run analysis and send email
@@ -91,5 +91,5 @@ jobs:
           git add -f data/rightmove_with_extra_fields_*.parquet || true
           git diff --cached --quiet && echo "No enriched parquet to push." && exit 0
           git commit -m "data: enriched fields $(date +'%Y-%m-%d')"
-          git pull --rebase
+          git pull --rebase --autostash
           git push
