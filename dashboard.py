@@ -256,6 +256,8 @@ def _apply_view_payload(payload: dict) -> None:
     st.session_state["rm_beds_min"] = f.get("rm_beds_min")
     st.session_state["rm_beds_max"] = f.get("rm_beds_max")
     st.session_state["rm_property_types"] = f.get("rm_property_types", [])
+    # Push restored types into the checkbox widgets on next render.
+    st.session_state["_rm_pt_pending"] = f.get("rm_property_types", [])
     st.session_state["rm_potential_auction"] = f.get("rm_potential_auction", False)
     st.session_state["rm_potential_hmo"] = f.get("rm_potential_hmo", False)
     st.session_state["map_center"] = m.get("center", UK_CENTER)
@@ -564,23 +566,40 @@ with st.expander("🔍 Filters", expanded=True):
                 .replace("nan", "").loc[lambda s: s.str.strip() != ""].unique().tolist()
             )
             if _opts:
-                if not st.session_state["rm_property_types"]:
-                    st.session_state["rm_property_types"] = _opts.copy()
+                def _cb_key(o):
+                    return f"rm_pt_cb::{o}"
+
+                # Apply any pending selection (from All/Clear or a loaded view)
+                # to the individual checkbox states before they render.
+                if "_rm_pt_pending" in st.session_state:
+                    _pending = set(st.session_state.pop("_rm_pt_pending"))
+                    for _o in _opts:
+                        st.session_state[_cb_key(_o)] = _o in _pending
+
+                # First render: seed checkbox states from saved types,
+                # defaulting to all selected when nothing is stored yet.
+                if not any(_cb_key(_o) in st.session_state for _o in _opts):
+                    _seed = set(st.session_state["rm_property_types"]) or set(_opts)
+                    for _o in _opts:
+                        st.session_state[_cb_key(_o)] = _o in _seed
 
                 _pa, _pb = st.columns(2)
                 if _pa.button("All", use_container_width=True, key="rm_pt_all"):
-                    st.session_state["rm_property_types"] = _opts.copy()
+                    st.session_state["_rm_pt_pending"] = list(_opts)
                     st.rerun()
                 if _pb.button("Clear", use_container_width=True, key="rm_pt_clear"):
-                    st.session_state["rm_property_types"] = []
+                    st.session_state["_rm_pt_pending"] = []
                     st.rerun()
 
-                _sel_types = st.multiselect(
-                    "Property types", options=_opts,
-                    default=st.session_state["rm_property_types"],
-                    label_visibility="collapsed",
-                )
+                # Checkbox list (two columns, scrollable if long)
+                with st.container(height=240):
+                    _cb_cols = st.columns(2)
+                    for _i, _o in enumerate(_opts):
+                        _cb_cols[_i % 2].checkbox(_o, key=_cb_key(_o))
+
+                _sel_types = [_o for _o in _opts if st.session_state.get(_cb_key(_o))]
                 st.session_state["rm_property_types"] = _sel_types
+                st.caption(f"{len(_sel_types)} of {len(_opts)} selected")
                 if _sel_types and filtered_rm is not None:
                     filtered_rm = filtered_rm[
                         filtered_rm["property_type"].astype("string").isin(_sel_types)
