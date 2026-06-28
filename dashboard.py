@@ -5,6 +5,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import folium
+from folium.plugins import Fullscreen
 from streamlit_folium import st_folium
 
 from hmo_layer import load_hmo_geojson, add_hmo_layer, hmo_feature_count
@@ -106,6 +107,14 @@ def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int,
     # Restrict panning/zooming to UK region
     m.options["maxBounds"] = [[49.0, -9.5], [61.5, 3.5]]
     m.options["maxBoundsViscosity"] = 1.0
+
+    # Native browser full-screen button on the map itself (top-left)
+    Fullscreen(
+        position="topleft",
+        title="Fill screen",
+        title_cancel="Exit full screen",
+        force_separate_button=True,
+    ).add_to(m)
 
     # HMO Article 4 polygons — added first so they sit beneath the markers
     add_hmo_layer(m, hmo_geojson, show=show_hmo)
@@ -666,7 +675,7 @@ if filtered_sr_offer is not None and {"lat_num", "lon_num"}.issubset(filtered_sr
 # ----------------------------
 # MAP HEADER
 # ----------------------------
-_hc1, _hc2 = st.columns([4, 1])
+_hc1, _hc2, _hc3 = st.columns([3, 1, 1])
 rm_count = len(filtered_rm) if filtered_rm is not None else 0
 sr_count = len(filtered_sr_offer) if filtered_sr_offer is not None else 0
 
@@ -682,11 +691,27 @@ with _hc2:
         value=3000,
         label_visibility="collapsed",
     )
+with _hc3:
+    st.checkbox(
+        "⛶ Maximise",
+        key="map_maximise",
+        help="Hide the tables and give the map the whole page. The ⛶ button on the "
+             "map gives true browser full-screen; use ↗ below to pop it into a new tab.",
+    )
 
 
 # ----------------------------
 # MAP
 # ----------------------------
+_maximise = bool(st.session_state.get("map_maximise"))
+map_height = 880 if _maximise else 540
+if _maximise:
+    # Trim Streamlit's default padding so the map gets the whole page.
+    st.markdown(
+        "<style>section.main .block-container{padding-top:1rem;padding-bottom:0;}</style>",
+        unsafe_allow_html=True,
+    )
+
 m = build_map(
     center=st.session_state.map_center,
     zoom=st.session_state.map_zoom,
@@ -696,11 +721,49 @@ m = build_map(
     hmo_geojson=st.session_state.hmo_geojson,
     show_hmo=st.session_state.get("show_hmo", True),
 )
+
+# Pop-out / download. folium's render() mutates the map, so build a SEPARATE
+# instance for the standalone HTML and leave `m` untouched for st_folium.
+_popout_map = build_map(
+    center=st.session_state.map_center,
+    zoom=st.session_state.map_zoom,
+    rm_df=filtered_rm,
+    sr_offer_df=filtered_sr_offer,
+    max_points_each=max_points_each,
+    hmo_geojson=st.session_state.hmo_geojson,
+    show_hmo=st.session_state.get("show_hmo", True),
+)
+_map_html = _popout_map.get_root().render()
+_b64 = base64.b64encode(_map_html.encode("utf-8")).decode("ascii")
+
+_po1, _po2, _po3 = st.columns([1, 1, 4])
+with _po1:
+    st.markdown(
+        f'<a href="data:text/html;base64,{_b64}" target="_blank" rel="noopener" '
+        f'style="display:inline-block;width:100%;box-sizing:border-box;padding:0.35rem '
+        f'0.5rem;border:1px solid rgba(49,51,63,0.2);border-radius:0.5rem;'
+        f'text-align:center;text-decoration:none;color:inherit;">↗ Open in new tab</a>',
+        unsafe_allow_html=True,
+    )
+with _po2:
+    st.download_button(
+        "⬇ Map HTML",
+        data=_map_html,
+        file_name="property_map.html",
+        mime="text/html",
+        use_container_width=True,
+        help="Self-contained interactive map you can open or share offline.",
+    )
+
 _lat, _lon = st.session_state.map_center
 _hmo_on = int(bool(st.session_state.get("show_hmo", True))
               and st.session_state.hmo_geojson is not None)
-_map_key = f"map_{_lat:.5f}_{_lon:.5f}_{st.session_state.map_zoom}_hmo{_hmo_on}"
-st_folium(m, height=540, use_container_width=True, key=_map_key, returned_objects=[])
+_map_key = f"map_{_lat:.5f}_{_lon:.5f}_{st.session_state.map_zoom}_hmo{_hmo_on}_h{map_height}"
+st_folium(m, height=map_height, use_container_width=True, key=_map_key, returned_objects=[])
+
+# In maximise mode, stop here so the map owns the page (no tables below).
+if _maximise:
+    st.stop()
 
 st.divider()
 
