@@ -1,5 +1,5 @@
-streamlit>=1.30
-pandas>=2.0
-pyarrow>=12
-folium>=0.14
-streamlit-folium>=0.18
+streamlit==1.52.2
+pandas==2.3.3
+pyarrow==22.0.0
+folium==0.20.0
+streamlit-folium==0.25.3
