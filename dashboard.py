@@ -7,6 +7,8 @@ import pandas as pd
 import folium
 from streamlit_folium import st_folium
 
+from hmo_layer import load_hmo_geojson, add_hmo_layer, hmo_feature_count
+
 
 # ----------------------------
 # CONFIG
@@ -19,6 +21,7 @@ DETAIL_ZOOM = 15
 
 DATA_DIR = Path(__file__).parent / "data"
 VIEWS_PATH = DATA_DIR / "views.json"
+HMO_GEOJSON_PATH = DATA_DIR / "england_hmo_article4.geojson"
 
 
 # ----------------------------
@@ -91,7 +94,8 @@ def _postcode_outcode(series: pd.Series) -> pd.Series:
 # ----------------------------
 # MAP  (GeoJson path: one Python object per layer, Leaflet renders N markers)
 # ----------------------------
-def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
+def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int,
+              hmo_geojson=None, show_hmo: bool = True):
     m = folium.Map(
         location=center,
         zoom_start=zoom,
@@ -102,6 +106,9 @@ def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int):
     # Restrict panning/zooming to UK region
     m.options["maxBounds"] = [[49.0, -9.5], [61.5, 3.5]]
     m.options["maxBoundsViscosity"] = 1.0
+
+    # HMO Article 4 polygons — added first so they sit beneath the markers
+    add_hmo_layer(m, hmo_geojson, show=show_hmo)
 
     def _add_layer(df, name: str, color: str, with_popup: bool = True):
         if df is None or df.empty:
@@ -295,6 +302,7 @@ _DEFAULTS = {
     "rm_property_types": [],
     "rm_potential_auction": False,
     "rm_potential_hmo": False,
+    "hmo_geojson": None,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -416,6 +424,39 @@ if _source == "Repo files":
     _repo_loader()
 else:
     _upload_loader()
+
+st.sidebar.divider()
+
+# ----------------------------
+# SIDEBAR: HMO ARTICLE 4 OVERLAY
+# ----------------------------
+# Auto-load the ingested GeoJSON once if it's sitting in ./data
+if st.session_state.hmo_geojson is None and HMO_GEOJSON_PATH.exists():
+    st.session_state.hmo_geojson = load_hmo_geojson(HMO_GEOJSON_PATH)
+
+st.sidebar.subheader("HMO Article 4 overlay")
+if st.session_state.hmo_geojson is not None:
+    _hmo_n = hmo_feature_count(st.session_state.hmo_geojson)
+    if "show_hmo" not in st.session_state:
+        st.session_state["show_hmo"] = True
+    st.sidebar.checkbox(f"Show HMO areas ({_hmo_n:,})", key="show_hmo")
+else:
+    st.sidebar.caption(
+        "Run `python ingest.py` to create "
+        "`data/england_hmo_article4.geojson`, then reload."
+    )
+    _hmo_up = st.sidebar.file_uploader(
+        "…or upload HMO GeoJSON", type=["geojson", "json"], key="hmo_upload"
+    )
+    if _hmo_up is not None:
+        try:
+            st.session_state.hmo_geojson = json.load(_hmo_up)
+            st.sidebar.success(
+                f"{hmo_feature_count(st.session_state.hmo_geojson):,} HMO areas"
+            )
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(str(e))
 
 st.sidebar.divider()
 
@@ -652,9 +693,13 @@ m = build_map(
     rm_df=filtered_rm,
     sr_offer_df=filtered_sr_offer,
     max_points_each=max_points_each,
+    hmo_geojson=st.session_state.hmo_geojson,
+    show_hmo=st.session_state.get("show_hmo", True),
 )
 _lat, _lon = st.session_state.map_center
-_map_key = f"map_{_lat:.5f}_{_lon:.5f}_{st.session_state.map_zoom}"
+_hmo_on = int(bool(st.session_state.get("show_hmo", True))
+              and st.session_state.hmo_geojson is not None)
+_map_key = f"map_{_lat:.5f}_{_lon:.5f}_{st.session_state.map_zoom}_hmo{_hmo_on}"
 st_folium(m, height=540, use_container_width=True, key=_map_key, returned_objects=[])
 
 st.divider()
