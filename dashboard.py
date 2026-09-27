@@ -101,9 +101,16 @@ def build_map(center, zoom, rm_df, sr_offer_df, max_points_each: int,
         location=center,
         zoom_start=zoom,
         min_zoom=5,
-        tiles="CartoDB positron",
+        tiles=None,
         control_scale=True,
     )
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors",
+        name="Light grey",
+        max_zoom=16,
+        control=False,
+    ).add_to(m)
     # Restrict panning/zooming to UK region
     m.options["maxBounds"] = [[49.0, -9.5], [61.5, 3.5]]
     m.options["maxBoundsViscosity"] = 1.0
